@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-06
+
+### Added
+
+- `facto config --env dev|prod` — switch between dev and prod environments
+- Integration test suite (`tests/smoke.sh`) for local and remote verification
+
+### Fixed
+
+- Recipient allowlist uses user-level endpoint (`/v1/recipients`) matching engine validation
+- Remove legacy `tempo_wallet` field from credentials and all commands
+
+### Changed
+
+- Default environment set to `dev` (`https://monad-api.facto.to`)
+- `prod` environment uses `https://api.facto.xyz`
+- `FACTO_API_URL` env var takes highest priority over config
+
 ## [0.1.0] - 2026-04-06
 
 ### Added
@@ -23,4 +41,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
+[0.2.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.1.0

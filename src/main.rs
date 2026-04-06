@@ -104,8 +104,12 @@ enum Commands {
         category: Option<String>,
     },
 
-    /// Configure deposit addresses and settings.
+    /// Configure environment, deposit addresses, and settings.
     Config {
+        /// Switch environment: dev or prod.
+        #[arg(long, value_parser = ["dev", "prod"])]
+        env: Option<String>,
+
         /// Set deposit address for cross-chain: --deposit-address <chain> <address>
         /// Example: --deposit-address arbitrum 0xfc8a...63c9
         #[arg(long, num_args = 2, value_names = ["CHAIN", "ADDRESS"])]
@@ -174,9 +178,10 @@ async fn main() -> Result<()> {
             cmd_services(query.as_deref(), category.as_deref(), cli.terse).await
         }
         Commands::Config {
+            env,
             deposit_address,
             show,
-        } => cmd_config(deposit_address, show, cli.terse),
+        } => cmd_config(env, deposit_address, show, cli.terse),
         Commands::Logout => cmd_logout(),
     }
 }
@@ -676,10 +681,10 @@ async fn cmd_fund(
         );
     }
 
-    // Check if recipient is in the pipeline's allowlist; if not, offer to add
-    let check_path = format!("/v1/routes/{}/recipients", route_id);
+    // Check if recipient is in user's allowlist; if not, offer to add.
+    // Engine validates against user-level recipients (/v1/recipients), not route-level.
     let allowlist: Vec<serde_json::Value> = api
-        .get(&check_path, Some(&creds.token))
+        .get("/v1/recipients", Some(&creds.token))
         .await
         .unwrap_or_default();
 
@@ -691,23 +696,21 @@ async fn cmd_fund(
     });
 
     if !in_allowlist {
+        let label = if resolved_recipient == eoa_address {
+            "Funding Source"
+        } else {
+            "CLI Added"
+        };
+        let add_body = serde_json::json!({ "address": resolved_recipient, "label": label });
+
         if terse {
-            // In terse/agent mode, auto-add without prompting
-            let add_body = serde_json::json!({
-                "address": resolved_recipient,
-                "label": if resolved_recipient == eoa_address { "Funding Source" } else { "CLI Added" },
-            });
             let _: serde_json::Value = api
-                .post_authenticated(
-                    &format!("/v1/routes/{}/recipients", route_id),
-                    &add_body,
-                    &creds.token,
-                )
+                .post_authenticated("/v1/recipients", &add_body, &creds.token)
                 .await
                 .context("Failed to add recipient to allowlist")?;
         } else {
             println!(
-                "⚠️  Address {} is not in this pipeline's allowlist.",
+                "⚠️  Address {} is not in your allowlist.",
                 resolved_recipient
             );
             print!("   Add it and continue? [Y/n] ");
@@ -719,18 +722,8 @@ async fn cmd_fund(
                 println!("Cancelled.");
                 return Ok(());
             }
-            let label = if resolved_recipient == eoa_address {
-                "Funding Source"
-            } else {
-                "CLI Added"
-            };
-            let add_body = serde_json::json!({ "address": resolved_recipient, "label": label });
             let _: serde_json::Value = api
-                .post_authenticated(
-                    &format!("/v1/routes/{}/recipients", route_id),
-                    &add_body,
-                    &creds.token,
-                )
+                .post_authenticated("/v1/recipients", &add_body, &creds.token)
                 .await
                 .context("Failed to add recipient to allowlist")?;
             println!("   ✅ Added to allowlist.");
@@ -1384,12 +1377,34 @@ async fn cmd_services(query: Option<&str>, category: Option<&str>, terse: bool) 
 }
 
 fn cmd_config(
+    env: Option<String>,
     deposit_address: Option<Vec<String>>,
     show: bool,
     terse: bool,
 ) -> Result<()> {
-    let mut creds = config::load_credentials()?;
+    let mut changed = false;
 
+    // --env: switch environment
+    if let Some(ref new_env) = env {
+        let mut cfg = config::load_config();
+        cfg.env = new_env.clone();
+        config::save_config(&cfg)?;
+        changed = true;
+        if terse {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "env": new_env,
+                    "api_url": config::api_url(),
+                }))?
+            );
+        } else {
+            println!("✅ Environment set: {new_env}");
+            println!("   API: {}", config::api_url());
+        }
+    }
+
+    // --deposit-address: set per-chain deposit address
     if let Some(args) = deposit_address {
         if args.len() != 2 {
             bail!(
@@ -1405,9 +1420,11 @@ fn cmd_config(
             );
         }
 
+        let mut creds = config::load_credentials()?;
         let map = creds.deposit_addresses.get_or_insert_with(Default::default);
         map.insert(chain.clone(), address.clone());
         config::save_credentials(&creds)?;
+        changed = true;
 
         if terse {
             println!(
@@ -1419,19 +1436,26 @@ fn cmd_config(
         } else {
             println!("✅ Deposit address set: {chain} → {address}");
         }
-        return Ok(());
     }
 
-    if show || deposit_address.is_none() {
-        let addrs = creds.deposit_addresses.as_ref();
+    // Show config when --show or no flags given
+    if show || (!changed && env.is_none()) {
+        let cfg = config::load_config();
+        let creds = config::load_credentials().ok();
+        let addrs = creds.as_ref().and_then(|c| c.deposit_addresses.as_ref());
+
         if terse {
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "deposit_addresses": addrs
+                    "env": cfg.env,
+                    "api_url": config::api_url(),
+                    "deposit_addresses": addrs,
                 }))?
             );
         } else {
+            println!("Environment:  {} ({})", cfg.env, config::api_url());
+            println!();
             println!("Deposit Addresses:");
             match addrs {
                 Some(m) if !m.is_empty() => {
@@ -1441,11 +1465,6 @@ fn cmd_config(
                 }
                 _ => {
                     println!("  (none configured)");
-                    println!();
-                    println!("Set one with:");
-                    println!(
-                        "  facto config --deposit-address arbitrum 0xYourAddress..."
-                    );
                 }
             }
         }

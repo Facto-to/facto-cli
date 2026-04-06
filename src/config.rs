@@ -80,9 +80,78 @@ pub fn clear_credentials() -> Result<()> {
     Ok(())
 }
 
+// ── Environment config (~/.facto/config.json) ──────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// Active environment: "dev" | "prod"
+    #[serde(default = "default_env")]
+    pub env: String,
+    /// Custom API URLs per environment (overrides built-in defaults)
+    #[serde(default)]
+    pub api_urls: std::collections::HashMap<String, String>,
+}
+
+fn default_env() -> String {
+    "dev".to_string()
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            env: default_env(),
+            api_urls: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Built-in API URLs per environment.
+fn builtin_api_url(env: &str) -> &'static str {
+    match env {
+        "dev" => "https://monad-api.facto.to",
+        "prod" => "https://api.facto.xyz",
+        _ => "https://monad-api.facto.to",
+    }
+}
+
+/// Returns the path to `~/.facto/config.json`.
+pub fn config_path() -> Result<PathBuf> {
+    Ok(facto_dir()?.join("config.json"))
+}
+
+/// Loads `~/.facto/config.json`, returns default if missing.
+pub fn load_config() -> AppConfig {
+    config_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Saves config to `~/.facto/config.json`.
+pub fn save_config(cfg: &AppConfig) -> Result<()> {
+    let path = config_path()?;
+    let json = serde_json::to_string_pretty(cfg).context("Failed to serialize config")?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("Failed to write config to {}", path.display()))?;
+    Ok(())
+}
+
 /// Returns the Facto API base URL.
 ///
-/// Reads `FACTO_API_URL` from the environment; falls back to the production URL.
+/// Priority: `FACTO_API_URL` env var > custom api_urls in config > built-in default for env.
 pub fn api_url() -> String {
-    std::env::var("FACTO_API_URL").unwrap_or_else(|_| "https://api.facto.xyz".to_string())
+    if let Ok(url) = std::env::var("FACTO_API_URL") {
+        return url;
+    }
+    let cfg = load_config();
+    if let Some(url) = cfg.api_urls.get(&cfg.env) {
+        return url.clone();
+    }
+    builtin_api_url(&cfg.env).to_string()
+}
+
+/// Returns the current active environment name.
+pub fn current_env() -> String {
+    load_config().env
 }
