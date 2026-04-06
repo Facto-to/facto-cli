@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="takara-xyz/facto-cli"
+REPO="Facto-to/facto-cli"
 BIN_NAME="facto"
 INSTALL_DIR="$HOME/.facto/bin"
 
