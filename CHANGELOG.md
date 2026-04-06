@@ -22,3 +22,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--dry-run` support for `fund` and `pay` commands
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
+
+[0.1.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.1.0
