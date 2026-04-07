@@ -57,15 +57,62 @@ fi
 chmod +x "${INSTALL_DIR}/${BIN_NAME}"
 
 # ---------------------------------------------------------------------------
+# Add to PATH (if not already present)
+# ---------------------------------------------------------------------------
+add_to_path() {
+  local shell_name="$1"
+  local rc_file="$2"
+
+  if [ ! -f "$rc_file" ]; then
+    return
+  fi
+
+  if grep -q "${INSTALL_DIR}" "$rc_file" 2>/dev/null; then
+    return  # already configured
+  fi
+
+  echo "" >> "$rc_file"
+  echo "# Facto CLI" >> "$rc_file"
+  echo "export PATH=\"${INSTALL_DIR}:\$PATH\"" >> "$rc_file"
+  echo "  Added to ${rc_file}"
+}
+
+ADDED_PATH=false
+
+case "$(basename "${SHELL:-/bin/bash}")" in
+  zsh)
+    if ! grep -q "${INSTALL_DIR}" "$HOME/.zshrc" 2>/dev/null; then
+      add_to_path "zsh" "$HOME/.zshrc"
+      ADDED_PATH=true
+    fi
+    ;;
+  bash)
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+      if [ -f "$rc" ] && ! grep -q "${INSTALL_DIR}" "$rc" 2>/dev/null; then
+        add_to_path "bash" "$rc"
+        ADDED_PATH=true
+        break
+      fi
+    done
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 # Success message
 # ---------------------------------------------------------------------------
 echo ""
 echo "Facto CLI installed to ${INSTALL_DIR}/${BIN_NAME}"
+
+if [ "$ADDED_PATH" = true ]; then
+  echo ""
+  echo "PATH updated. Run this to use facto in the current shell:"
+  echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+fi
+
 echo ""
 echo "Get started:"
-echo "  \"${INSTALL_DIR}/${BIN_NAME}\" login      # Authenticate (opens browser)"
-echo "  \"${INSTALL_DIR}/${BIN_NAME}\" whoami     # Verify login"
-echo "  \"${INSTALL_DIR}/${BIN_NAME}\" pipelines  # Check available DeFi balance"
-echo "  \"${INSTALL_DIR}/${BIN_NAME}\" fund --amount 10  # Withdraw USDC from DeFi position"
+echo "  facto login      # Authenticate (opens browser)"
+echo "  facto whoami     # Verify login"
+echo "  facto pipelines  # Check available DeFi balance"
+echo "  facto fund --amount 10  # Withdraw USDC from DeFi position"
 echo ""
-echo "Use full absolute paths (do not rely on \$PATH)."
