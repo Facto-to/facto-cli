@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-07
+
+### Fixed
+
+- Install script auto-configures PATH in `.zshrc` / `.bashrc` — `facto` works immediately in new shells
+- Install URL updated to `monad-api.facto.to/install` (live endpoint)
+
+### Changed
+
+- Simplify all docs: remove `--chain` flags (auto-detected), remove manual fund step from quickstart
+- Agent workflow: discover → pay → fund only if needed
+- SKILL.md rewritten for cleaner agent integration
+
 ## [0.3.0] - 2026-04-07
 
 ### Added
@@ -62,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
+[0.3.1]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.1.0
