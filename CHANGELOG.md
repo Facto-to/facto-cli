@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-07
+
+### Added
+
+- Clear `Settling` vs `Confirmed` history output for x402 payments, including settlement transaction hash extraction from x402 response payloads
+
+### Fixed
+
+- Preserve configured deposit addresses across re-login flows
+- Reject unsupported API key login for user commands with an explicit error instead of storing broken credentials
+- Stop `fund --dry-run` from mutating recipient allowlists
+- Return non-zero exit codes for `facto pay` validation and payment errors instead of printing success-shaped output
+- Surface authentication failures from `whoami` and `pipelines` instead of silently returning empty success responses
+- Show micro-amount USDC values accurately in `facto history`
+- Use BaseScan links for Base funding transactions
+
+### Changed
+
+- README and command help now document browser login and dev-token flows as the supported authentication paths for CLI user commands
+- Cargo install documentation now distinguishes Cargo's binary directory from the bundled install script location
+
 ## [0.2.0] - 2026-04-06
 
 ### Added
@@ -41,5 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
+[0.3.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.1.0

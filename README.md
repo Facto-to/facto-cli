@@ -39,7 +39,7 @@ curl -fsSL https://facto.xyz/install | bash
 cargo install facto-cli
 ```
 
-The binary is named `facto` and installs to `~/.facto/bin/`.
+The binary is named `facto`. The bundled installer writes to `~/.facto/bin/facto`. `cargo install` follows Cargo's bin directory, typically `~/.cargo/bin/facto`.
 
 ## Quick Start
 
@@ -64,7 +64,7 @@ facto services
 
 | Command | Description |
 |---------|-------------|
-| `facto login` | Authenticate via browser (Privy OAuth), API key, or dev token |
+| `facto login` | Authenticate via browser (Privy OAuth) or dev token |
 | `facto whoami` | Show current account and pipeline count |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
 | `facto fund --amount N` | Withdraw N USDC from a DeFi position to your wallet |
@@ -93,18 +93,17 @@ facto services
 
 ## Authentication
 
-Facto CLI supports three authentication modes:
+Facto CLI supports these authentication modes today:
 
 ```bash
 # Browser-based (default) — opens Privy OAuth flow
 facto login
 
-# API key — for server/CI environments
-facto login --api-key <KEY> --signing-key <SECRET>
-
 # Dev token — for local testing only
 facto login --dev-token "dev:<user_id>"
 ```
+
+`--api-key` / `--signing-key` are reserved for future server and CI support, but CLI user commands currently require browser login or `--dev-token`.
 
 Credentials are stored in `~/.facto/credentials.json`.
 
@@ -128,10 +127,11 @@ facto -t services "weather"
 
 ### Typical Agent Workflow
 
-1. `facto -t pipelines` — check wallet balance
-2. If balance is low: `facto fund --amount 5`
-3. `facto -t services "<keyword>"` — find the right API
-4. `facto -t pay GET "<url>"` — call and parse the response
+1. `facto -t pipelines` — inspect DeFi pipeline balance
+2. `facto -t balance --chain 8453` — check server-wallet balance for x402 spends
+3. If balance is low: `facto fund --amount 5`
+4. `facto -t services "<keyword>"` — find the right API
+5. `facto -t pay GET "<url>"` — call and parse the response
 
 ## Configuration
 

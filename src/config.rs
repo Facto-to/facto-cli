@@ -150,8 +150,3 @@ pub fn api_url() -> String {
     }
     builtin_api_url(&cfg.env).to_string()
 }
-
-/// Returns the current active environment name.
-pub fn current_env() -> String {
-    load_config().env
-}

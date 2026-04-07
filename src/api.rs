@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
 use serde::de::DeserializeOwned;
 use sha2::Sha256;
@@ -54,29 +54,6 @@ impl FactoApi {
             req = req.bearer_auth(t);
         }
         let resp = req
-            .send()
-            .await
-            .with_context(|| format!("GET {url} failed"))?;
-
-        self.parse_response(resp).await
-    }
-
-    /// Sends a GET request authenticated via HMAC headers.
-    pub async fn get_hmac<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        api_key: &str,
-        signing_key: &str,
-    ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let timestamp = chrono::Utc::now().timestamp().to_string();
-        let signature = hmac_sign(signing_key, &timestamp, "GET", path);
-        let resp = self
-            .client
-            .get(&url)
-            .header("X-Api-Key", api_key)
-            .header("X-Timestamp", &timestamp)
-            .header("X-Signature", &signature)
             .send()
             .await
             .with_context(|| format!("GET {url} failed"))?;
@@ -143,7 +120,7 @@ impl FactoApi {
     }
 }
 
-/// Computes an HMAC-SHA256 signature for API key authentication.
+/// Computes an HMAC-SHA256 signature for reserved HMAC authentication flows.
 ///
 /// The signing string is `"{timestamp}.{METHOD}.{path}"`.
 fn hmac_sign(signing_key: &str, timestamp: &str, method: &str, path: &str) -> String {

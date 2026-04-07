@@ -1,7 +1,7 @@
 mod api;
 mod config;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::io::Write as _;
@@ -20,9 +20,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Authenticate via browser (Privy OAuth), API key, or dev token.
+    /// Authenticate via browser (Privy OAuth) or dev token.
     Login {
-        /// API key for programmatic access (skip browser login).
+        /// Reserved for future CI/server support. Not supported for CLI user commands yet.
         #[arg(long)]
         api_key: Option<String>,
         /// HMAC signing key (required with --api-key).
@@ -47,7 +47,7 @@ enum Commands {
 
         /// Recipient address. Must be in the pipeline's allowlist.
         /// Defaults to your own EOA (self-funding).
-        /// Run `facto recipients --pipeline <ID>` to see allowed addresses.
+        /// If missing from the allowlist, CLI will offer to add it before execution.
         #[arg(short = 'r', long)]
         to: Option<String>,
 
@@ -214,6 +214,10 @@ async fn cmd_login(
     signing_key: Option<String>,
     dev_token: Option<String>,
 ) -> Result<()> {
+    let preserved_deposit_addresses = config::load_credentials()
+        .ok()
+        .and_then(|creds| creds.deposit_addresses);
+
     // --- Mode 1: dev token ---
     if let Some(token) = dev_token {
         let user_id = token
@@ -229,7 +233,7 @@ async fn cmd_login(
             api_key: None,
             signing_key: None,
             auth_mode: Some("dev".to_string()),
-            deposit_addresses: None,
+            deposit_addresses: preserved_deposit_addresses,
         })?;
 
         if terse {
@@ -251,47 +255,16 @@ async fn cmd_login(
     }
 
     // --- Mode 2: API key + signing key ---
-    if let Some(key) = api_key {
-        let sk = signing_key
+    if let Some(_key) = api_key {
+        let _sk = signing_key
             .ok_or_else(|| anyhow::anyhow!("--signing-key is required with --api-key"))?;
-
-        let facto = api::FactoApi::new();
-
-        // Test the key by calling GET /v1/routes/me
-        let _routes: Vec<serde_json::Value> =
-            facto.get_hmac("/v1/routes/me", &key, &sk).await.context(
-                "API key validation failed — check that --api-key and --signing-key are correct",
-            )?;
-
-        config::save_credentials(&config::Credentials {
-            token: String::new(),
-            user_id: String::new(),
-            email: None,
-            expires_at: "2099-12-31T00:00:00Z".parse().unwrap(),
-            api_key: Some(key.clone()),
-            signing_key: Some(sk.clone()),
-            auth_mode: Some("api_key".to_string()),
-            deposit_addresses: None,
-        })?;
-
-        if terse {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "status": "authenticated",
-                    "auth_mode": "api_key",
-                    "api_key": key,
-                }))?
-            );
-        } else {
-            println!("✅ API key authenticated and saved");
-            println!("Auth mode:  api_key");
-        }
-        return Ok(());
+        bail!(
+            "API key authentication is not supported for facto-cli user commands yet. Use browser login or --dev-token."
+        );
     }
 
     // --- Mode 3: browser-based Privy login (default) ---
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{sleep, Duration};
 
     let facto = api::FactoApi::new();
 
@@ -335,7 +308,7 @@ async fn cmd_login(
                     api_key: None,
                     signing_key: None,
                     auth_mode: Some("privy".to_string()),
-                    deposit_addresses: None,
+                    deposit_addresses: preserved_deposit_addresses.clone(),
                 })?;
 
                 if terse {
@@ -367,22 +340,105 @@ async fn cmd_login(
     }
 }
 
+fn ensure_user_bearer_auth(creds: &config::Credentials) -> Result<()> {
+    if matches!(creds.auth_mode.as_deref(), Some("api_key")) {
+        bail!(
+            "API key authentication is not supported for facto-cli user commands yet. Use browser login or --dev-token."
+        );
+    }
+    if creds.token.trim().is_empty() {
+        bail!("Missing bearer token. Run `facto login` again.");
+    }
+    Ok(())
+}
+
+fn format_usdc_amount(raw: u64) -> String {
+    let value = raw as f64 / 1_000_000.0;
+    if value >= 1.0 {
+        format!("${value:.2}")
+    } else if value >= 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.6}")
+    }
+}
+
+fn extract_settlement_tx_hash(value: &serde_json::Value) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "settlement_tx_hash",
+        "settlementTxHash",
+        "tx_hash",
+        "txHash",
+        "transaction_hash",
+        "transactionHash",
+    ];
+    for key in KEYS {
+        if let Some(tx_hash) = value.get(key).and_then(|v| v.as_str()) {
+            let trimmed = tx_hash.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    match value {
+        serde_json::Value::Object(map) => map.values().find_map(extract_settlement_tx_hash),
+        serde_json::Value::Array(items) => items.iter().find_map(extract_settlement_tx_hash),
+        _ => None,
+    }
+}
+
+fn charge_settlement_tx_hash(charge: &serde_json::Value) -> Option<String> {
+    charge
+        .get("transaction_hash")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            charge
+                .get("x402_response_body")
+                .and_then(|v| v.as_str())
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|json| extract_settlement_tx_hash(&json))
+        })
+}
+
+fn charge_response_success_flag(charge: &serde_json::Value) -> Option<bool> {
+    charge
+        .get("x402_response_body")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|json| json.get("success").and_then(|v| v.as_bool()))
+}
+
 async fn cmd_whoami(terse: bool) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
+
+    let me: serde_json::Value = api
+        .get("/v1/auth/me", Some(&creds.token))
+        .await
+        .context("Failed to fetch authenticated account")?;
 
     let routes: Vec<serde_json::Value> = api
         .get("/v1/routes/me", Some(&creds.token))
         .await
-        .unwrap_or_default();
+        .context("Failed to fetch routes")?;
 
     let pipeline_count = routes.len();
-    let email = creds.email.as_deref().unwrap_or("");
+    let email = me["email"]
+        .as_str()
+        .filter(|email| !email.is_empty())
+        .or(creds.email.as_deref())
+        .unwrap_or("");
+    let user_id = me["user_id"]
+        .as_str()
+        .filter(|user_id| !user_id.is_empty())
+        .unwrap_or(&creds.user_id);
 
     if terse {
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "user_id": creds.user_id,
+                "user_id": user_id,
                 "email": email,
                 "pipelines": pipeline_count,
                 "authenticated": true,
@@ -390,7 +446,7 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
         );
     } else {
         println!("User:          {email}");
-        println!("User ID:       {}", creds.user_id);
+        println!("User ID:       {user_id}");
         println!("Pipelines:     {pipeline_count}");
         println!("Authenticated: ✅");
     }
@@ -400,6 +456,7 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
 
 async fn cmd_balance(chain_id: u64, terse: bool) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
 
     let resp: serde_json::Value = api
         .get(
@@ -424,11 +481,12 @@ async fn cmd_balance(chain_id: u64, terse: bool) -> Result<()> {
 
 async fn cmd_pipelines(terse: bool) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
 
     let routes: Vec<serde_json::Value> = api
         .get("/v1/routes/me", Some(&creds.token))
         .await
-        .unwrap_or_default();
+        .context("Failed to fetch routes")?;
 
     // Filter to active routes only
     let active_routes: Vec<&serde_json::Value> = routes
@@ -440,6 +498,11 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
                 .unwrap_or(false)
         })
         .collect();
+
+    let me: serde_json::Value = api
+        .get("/v1/auth/me", Some(&creds.token))
+        .await
+        .context("Failed to fetch authenticated user")?;
 
     if active_routes.is_empty() {
         if terse {
@@ -456,10 +519,6 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
     // Fetch real-time balance for each route via pre-check API
     // Endpoint: GET /v1/charges/pre-check/{yield_token}/{eoa_address}/{spender}?chain_id={chain_id}
     // The spender is the user's server wallet address (from /v1/auth/me or route eoa_address)
-    let me: serde_json::Value = api
-        .get("/v1/auth/me", Some(&creds.token))
-        .await
-        .unwrap_or(serde_json::json!({}));
     let server_wallet = me["wallet_address"]
         .as_str()
         .filter(|a| !a.is_empty() && *a != "0x0000000000000000000000000000000000000000")
@@ -488,7 +547,11 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
             .unwrap_or("unknown");
 
         // Query real-time balance from chain
-        let spender = if server_wallet.is_empty() { eoa } else { server_wallet };
+        let spender = if server_wallet.is_empty() {
+            eoa
+        } else {
+            server_wallet
+        };
         let pre_check_path = format!(
             "/v1/charges/pre-check/{}/{}/{}?chain_id={}",
             yield_token, eoa, spender, chain_id
@@ -567,6 +630,7 @@ async fn cmd_fund(
     terse: bool,
 ) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
 
     // Parse and validate amount
     let parsed: f64 = amount
@@ -681,12 +745,10 @@ async fn cmd_fund(
         );
     }
 
-    // Check if recipient is in user's allowlist; if not, offer to add.
-    // Engine validates against user-level recipients (/v1/recipients), not route-level.
     let allowlist: Vec<serde_json::Value> = api
         .get("/v1/recipients", Some(&creds.token))
         .await
-        .unwrap_or_default();
+        .context("Failed to fetch recipient allowlist")?;
 
     let in_allowlist = allowlist.iter().any(|r| {
         r["address"]
@@ -695,6 +757,40 @@ async fn cmd_fund(
             .unwrap_or(false)
     });
 
+    if dry_run {
+        if terse {
+            let allowlist_action = if in_allowlist { "none" } else { "would_add" };
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "dry_run": true,
+                    "amount": display_amount,
+                    "route_id": route_id,
+                    "chain_id": chain_id,
+                    "recipient": resolved_recipient,
+                    "allowlist_action": allowlist_action,
+                }))?
+            );
+        } else {
+            let dest_label = if resolved_recipient == eoa_address {
+                format!("{resolved_recipient} (self)")
+            } else {
+                resolved_recipient.to_string()
+            };
+            println!("Dry run — would fund ${display_amount} USDC");
+            println!("  Route:       {route_id}");
+            println!("  Chain ID:    {chain_id}");
+            println!("  Protocol:    {protocol_id}");
+            println!("  Recipient:   {dest_label}");
+            if !in_allowlist {
+                println!("  Allowlist:   would add recipient before execution");
+            }
+        }
+        return Ok(());
+    }
+
+    // Check if recipient is in user's allowlist; if not, offer to add.
+    // Engine validates against user-level recipients (/v1/recipients), not route-level.
     if !in_allowlist {
         let label = if resolved_recipient == eoa_address {
             "Funding Source"
@@ -730,34 +826,6 @@ async fn cmd_fund(
         }
     }
 
-    if dry_run {
-        if terse {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "dry_run": true,
-                    "amount": display_amount,
-                    "route_id": route_id,
-                    "chain_id": chain_id,
-                    "recipient": recipient.unwrap_or(eoa_address),
-                }))?
-            );
-        } else {
-            let dest = recipient.unwrap_or(eoa_address);
-            let dest_label = if dest == eoa_address {
-                format!("{dest} (self)")
-            } else {
-                dest.to_string()
-            };
-            println!("Dry run — would fund ${display_amount} USDC");
-            println!("  Route:       {route_id}");
-            println!("  Chain ID:    {chain_id}");
-            println!("  Protocol:    {protocol_id}");
-            println!("  Recipient:   {dest_label}");
-        }
-        return Ok(());
-    }
-
     let chain_name = chain_display_name(chain_id);
 
     if !terse {
@@ -770,7 +838,7 @@ async fn cmd_fund(
     let me: serde_json::Value = api
         .get("/v1/auth/me", Some(&creds.token))
         .await
-        .unwrap_or(serde_json::json!({}));
+        .context("Failed to fetch authenticated user")?;
     let user_wallet = me["wallet_address"]
         .as_str()
         .filter(|a| !a.is_empty() && *a != "0x0000000000000000000000000000000000000000")
@@ -811,13 +879,14 @@ async fn cmd_fund(
         42161 => "https://arbiscan.io",
         421614 => "https://sepolia.arbiscan.io",
         143 => "https://monadscan.com",
+        8453 => "https://basescan.org",
         _ => "https://etherscan.io",
     };
     let explorer_url = format!("{explorer_base}/tx/{tx_hash}");
     let facto_url = format!("https://facto.xyz/charges/{charge_id}");
 
     // Confirm balance arrived on-chain (poll up to ~30s)
-    let confirmed_balance = if resolved_recipient == &user_wallet {
+    let confirmed_balance = if resolved_recipient == user_wallet {
         // Recipient is the user's own wallet — verify balance reflects the deposit
         if !terse {
             print!("  Confirming on-chain");
@@ -837,8 +906,9 @@ async fn cmd_fund(
                 print!(".");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
-            if let Ok(bal) =
-                api.get::<serde_json::Value>(&balance_path, Some(&creds.token)).await
+            if let Ok(bal) = api
+                .get::<serde_json::Value>(&balance_path, Some(&creds.token))
+                .await
             {
                 let raw = bal["usdc_balance"]
                     .as_str()
@@ -874,7 +944,7 @@ async fn cmd_fund(
         });
         if let Some(ref bal) = confirmed_balance {
             json["confirmed_balance"] = serde_json::Value::String(bal.clone());
-        } else if resolved_recipient == &user_wallet {
+        } else if resolved_recipient == user_wallet {
             json["balance_confirmed"] = serde_json::Value::Bool(false);
         }
         println!("{}", serde_json::to_string(&json)?);
@@ -894,18 +964,19 @@ async fn cmd_fund(
 
 async fn cmd_history(terse: bool) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
 
     // Fetch user's wallet address from whoami/routes to get the correct address
     let routes: Vec<serde_json::Value> = api
         .get("/v1/routes/me", Some(&creds.token))
         .await
-        .unwrap_or_default();
+        .context("Failed to fetch routes")?;
 
     // Resolve user's server wallet address (charges are indexed by user_address = server wallet)
     let me: serde_json::Value = api
         .get("/v1/auth/me", Some(&creds.token))
         .await
-        .unwrap_or(serde_json::json!({}));
+        .context("Failed to fetch authenticated user")?;
     let user_wallet = me["wallet_address"]
         .as_str()
         .filter(|a| !a.is_empty() && *a != "0x0000000000000000000000000000000000000000")
@@ -999,13 +1070,13 @@ async fn cmd_history(terse: bool) -> Result<()> {
                 .get("underlying_amount")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<u64>().ok())
-                .map(|raw| format!("${:.2}", raw as f64 / 1_000_000.0))
+                .map(format_usdc_amount)
                 .unwrap_or_else(|| "—".to_string());
 
             // Shorten transaction_hash: first 6 + "..." + last 4 (if > 14 chars)
-            let tx_hash_display = charge
-                .get("transaction_hash")
-                .and_then(|v| v.as_str())
+            let settlement_tx_hash = charge_settlement_tx_hash(charge);
+            let tx_hash_display = settlement_tx_hash
+                .as_deref()
                 .map(|hash| {
                     if hash.len() > 14 {
                         format!("{}...{}", &hash[..6], &hash[hash.len() - 4..])
@@ -1027,6 +1098,17 @@ async fn cmd_history(terse: bool) -> Result<()> {
                 })
                 .unwrap_or_else(|| "—".to_string());
 
+            let status_display = if charge_type == "x402" {
+                match charge_response_success_flag(charge) {
+                    Some(false) => "❌ failed".to_string(),
+                    _ if settlement_tx_hash.is_some() => status_display,
+                    _ if status_display == "✅ Confirmed" => "⏳ Settling".to_string(),
+                    _ => status_display,
+                }
+            } else {
+                status_display
+            };
+
             println!(
                 "{} {:<19} {:<11} {:<15} {}{}",
                 type_icon,
@@ -1042,6 +1124,7 @@ async fn cmd_history(terse: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_pay(
     method: &str,
     url: &str,
@@ -1053,6 +1136,7 @@ async fn cmd_pay(
     terse: bool,
 ) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
 
     // Parse custom headers
     let mut header_map = std::collections::HashMap::new();
@@ -1116,7 +1200,7 @@ async fn cmd_pay(
 
     let status = resp["status"].as_str().unwrap_or("unknown");
 
-    if status == "failed" {
+    if status == "error" || status == "failed" {
         let error = resp["error"].as_str().unwrap_or("Unknown error");
         if terse {
             println!("{}", serde_json::to_string(&resp)?);
@@ -1124,6 +1208,10 @@ async fn cmd_pay(
             println!("❌ {error}");
         }
         bail!("{error}");
+    }
+
+    if status != "paid" && status != "free" {
+        bail!("Unexpected x402 pay status: {status}");
     }
 
     if terse {
@@ -1234,6 +1322,7 @@ fn format_services_human(items: &[serde_json::Value], total: i64, query: Option<
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1334,6 +1423,53 @@ mod tests {
         // Should fallback to String
         assert!(parsed.as_ref().unwrap().is_string());
         assert_eq!(parsed.as_ref().unwrap().as_str().unwrap(), "not valid json");
+    }
+
+    #[test]
+    fn test_format_usdc_amount_small_values() {
+        assert_eq!(format_usdc_amount(1200), "$0.001200");
+        assert_eq!(format_usdc_amount(12_000), "$0.0120");
+        assert_eq!(format_usdc_amount(1_000_000), "$1.00");
+    }
+
+    #[test]
+    fn test_extract_settlement_tx_hash_nested_payment() {
+        let body = serde_json::json!({
+            "status": "confirmed",
+            "payment": {
+                "settlement": {
+                    "transactionHash": "0xabc123"
+                }
+            }
+        });
+        assert_eq!(
+            extract_settlement_tx_hash(&body).as_deref(),
+            Some("0xabc123")
+        );
+    }
+
+    #[test]
+    fn test_charge_response_success_flag_reads_x402_body() {
+        let charge = serde_json::json!({
+            "x402_response_body": "{\"success\":false,\"error\":\"boom\"}"
+        });
+        assert_eq!(charge_response_success_flag(&charge), Some(false));
+    }
+
+    #[test]
+    fn test_ensure_user_bearer_auth_rejects_api_key_mode() {
+        let creds = config::Credentials {
+            token: String::new(),
+            user_id: String::new(),
+            email: None,
+            expires_at: "2099-12-31T00:00:00Z".parse().unwrap(),
+            api_key: Some("key".to_string()),
+            signing_key: Some("secret".to_string()),
+            auth_mode: Some("api_key".to_string()),
+            deposit_addresses: None,
+        };
+        let err = ensure_user_bearer_auth(&creds).unwrap_err().to_string();
+        assert!(err.contains("API key authentication is not supported"));
     }
 }
 
