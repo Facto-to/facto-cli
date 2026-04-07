@@ -47,17 +47,11 @@ The binary is named `facto`. The bundled installer writes to `~/.facto/bin/facto
 # 1. Authenticate (opens browser for Privy OAuth)
 facto login
 
-# 2. Check your DeFi positions and available balance
-facto pipelines
+# 2. Call a paid API — payment is handled automatically
+facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
 
-# 3. Withdraw USDC to your server wallet
-facto fund --amount 5
-
-# 4. Call a paid API — payment is handled automatically
-facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0" --chain 8453
-
-# 5. Discover more x402 services
-facto services
+# 3. Discover more x402 services
+facto services "weather"
 ```
 
 ## Commands
@@ -81,7 +75,6 @@ facto services
 |------|-------------|
 | `-t, --terse` | Output compact JSON (machine-readable, ideal for agents) |
 | `--dry-run` | Preview a transaction without executing it |
-| `--chain <ID>` | Target chain ID (default varies by command) |
 
 ## Supported Chains
 
@@ -112,26 +105,25 @@ Credentials are stored in `~/.facto/credentials.json`.
 The `-t` (terse) flag outputs structured JSON on every command, designed for programmatic consumption by AI agents and scripts:
 
 ```bash
-# Check balance before making a call
-facto -t pipelines
-# => {"pipelines":[{"route_id":"...","balance":"10.50","asset_symbol":"USDC",...}]}
-
 # Call a paid API
-facto -t pay GET "https://api.example.com/data" --chain 8453
+facto -t pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
 # => {"status":"paid","payment":{"amount":"5000","charge_id":"..."},"response":{"status_code":200,"body":"..."}}
 
 # Discover services
 facto -t services "weather"
 # => [{"url":"https://...","name":"Weather API","price_usdc":"0.0050",...}]
+
+# Check balance
+facto -t balance
+# => {"usdc_balance_display":"$0.0500",...}
 ```
 
 ### Typical Agent Workflow
 
-1. `facto -t pipelines` — inspect DeFi pipeline balance
-2. `facto -t balance --chain 8453` — check server-wallet balance for x402 spends
-3. If balance is low: `facto fund --amount 5`
-4. `facto -t services "<keyword>"` — find the right API
-5. `facto -t pay GET "<url>"` — call and parse the response
+1. `facto -t services "<keyword>"` — find the right API
+2. `facto -t pay GET "<url>"` — call and parse the response
+3. If balance is low: `facto fund --amount 5` — auto-selects pipeline
+4. `facto -t pipelines` — inspect DeFi pipeline balance if needed
 
 ## Configuration
 
