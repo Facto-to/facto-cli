@@ -82,16 +82,16 @@ enum Commands {
         /// Preview payment without executing.
         #[arg(long)]
         dry_run: bool,
-        /// Chain ID (default: 143 Monad).
-        #[arg(long, default_value = "143")]
-        chain: u64,
+        /// Chain ID. If omitted, auto-detects from your active pipeline.
+        #[arg(long)]
+        chain: Option<u64>,
     },
 
     /// Check server wallet USDC balance for x402 payments.
     Balance {
-        /// Chain ID (default: 8453 Base).
-        #[arg(long, default_value = "8453")]
-        chain: u64,
+        /// Chain ID. If omitted, auto-detects from your active pipeline.
+        #[arg(long)]
+        chain: Option<u64>,
     },
 
     /// Discover x402-enabled services. Optionally filter by keyword.
@@ -454,9 +454,47 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_balance(chain_id: u64, terse: bool) -> Result<()> {
+/// Resolves chain_id: uses explicit value if provided, otherwise auto-detects
+/// from the user's first active pipeline.
+async fn resolve_chain_id(
+    explicit: Option<u64>,
+    api: &api::FactoApi,
+    token: &str,
+) -> Result<u64> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+
+    // Fetch routes and find first active one
+    let routes: Vec<serde_json::Value> = api
+        .get("/v1/routes/me", Some(token))
+        .await
+        .context("Failed to fetch routes for chain auto-detection")?;
+
+    let active = routes
+        .iter()
+        .find(|r| {
+            r["status"]
+                .as_str()
+                .unwrap_or("")
+                .eq_ignore_ascii_case("active")
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No active pipeline found. Cannot auto-detect chain.\n\
+                 Specify --chain <ID> explicitly, or create a pipeline at https://facto.xyz"
+            )
+        })?;
+
+    active["chain_id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Pipeline has no chain_id"))
+}
+
+async fn cmd_balance(chain: Option<u64>, terse: bool) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
     ensure_user_bearer_auth(&creds)?;
+    let chain_id = resolve_chain_id(chain, &api, &creds.token).await?;
 
     let resp: serde_json::Value = api
         .get(
@@ -1132,11 +1170,12 @@ async fn cmd_pay(
     data: Option<&str>,
     max_amount: Option<&str>,
     dry_run: bool,
-    chain: u64,
+    chain: Option<u64>,
     terse: bool,
 ) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
     ensure_user_bearer_auth(&creds)?;
+    let chain = resolve_chain_id(chain, &api, &creds.token).await?;
 
     // Parse custom headers
     let mut header_map = std::collections::HashMap::new();
@@ -1317,7 +1356,7 @@ fn format_services_human(items: &[serde_json::Value], total: i64, query: Option<
         }
         out.push('\n');
     }
-    out.push_str("Usage: facto pay POST <url> --data '{...}' --chain 8453");
+    out.push_str("Usage: facto pay POST <url> --data '{...}'");
     out
 }
 
