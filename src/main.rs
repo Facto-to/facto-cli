@@ -600,8 +600,11 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
         {
             Ok(pc) => {
                 let raw = pc.get("balance").and_then(|v| v.as_str()).unwrap_or("0");
-                let atomic: u64 = raw.parse().unwrap_or(0);
-                let divisor = 10u64.pow(asset_dec as u32);
+                let atomic: u128 = raw.parse().unwrap_or(0);
+                // Morpho returns 18-dec values regardless of asset_decimals;
+                // use 18 for morpho, asset_decimals for others.
+                let effective_dec = if protocol == "morpho" { 18 } else { asset_dec };
+                let divisor = 10u128.pow(effective_dec as u32);
                 format!("{:.2}", atomic as f64 / divisor as f64)
             }
             Err(_) => "? (pre-check failed)".to_string(),
@@ -900,9 +903,16 @@ async fn cmd_fund(
                 .get("balance")
                 .and_then(|v| v.as_str())
                 .unwrap_or("0");
-            let balance_atomic: u64 = balance_raw.parse().unwrap_or(0);
-            let divisor = 10u64.pow(asset_dec as u32);
+            let balance_atomic: u128 = balance_raw.parse().unwrap_or(0);
+            // Morpho returns 18-dec values regardless of asset_decimals
+            let effective_dec = if protocol_id == "morpho" { 18 } else { asset_dec };
+            let divisor = 10u128.pow(effective_dec as u32);
             let balance_human = format!("{:.2}", balance_atomic as f64 / divisor as f64);
+
+            // Client-side balance check: compare in human-readable units
+            // (backend may have precision mismatch for Morpho 18-dec vs 6-dec amounts)
+            let balance_f64: f64 = balance_human.parse().unwrap_or(0.0);
+            let redeemable = redeemable && balance_f64 >= parsed;
 
             if !redeemable {
                 let reasons = pc
