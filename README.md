@@ -30,7 +30,7 @@ Your DeFi Position (Aave V3 / Morpho)
 **Pre-built binary** (macOS / Linux):
 
 ```bash
-curl -fsSL https://facto.xyz/install | bash
+curl -fsSL https://monad-api.facto.to/install | bash
 ```
 
 **Via Cargo**:

@@ -10,7 +10,7 @@ Supported chains:
 ## Setup (one-time, requires user interaction)
 
 1. Install:
-   curl -fsSL https://facto.xyz/install | bash
+   curl -fsSL https://monad-api.facto.to/install | bash
 
 2. Login (opens browser):
    "$HOME/.facto/bin/facto" login
