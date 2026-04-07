@@ -866,13 +866,7 @@ async fn cmd_fund(
 
     let chain_name = chain_display_name(chain_id);
 
-    if !terse {
-        println!("Funding ${display_amount} USDC from {protocol_id} on {chain_name} → wallet...");
-    }
-
-    // Resolve user's server wallet address (needed as user_address for charge execution)
-    // The backend uses this to look up the user's Privy wallet ID for 7702 signing.
-    // Try /v1/auth/me first, fall back to route's eoa_address.
+    // ── Pre-check: verify DeFi position has sufficient balance ──────────
     let me: serde_json::Value = api
         .get("/v1/auth/me", Some(&creds.token))
         .await
@@ -882,6 +876,81 @@ async fn cmd_fund(
         .filter(|a| !a.is_empty() && *a != "0x0000000000000000000000000000000000000000")
         .unwrap_or(eoa_address)
         .to_string();
+
+    let spender = if user_wallet.is_empty() {
+        eoa_address
+    } else {
+        &user_wallet
+    };
+    let asset_dec = route
+        .get("asset_decimals")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(6);
+    let pre_check_path = format!(
+        "/v1/charges/pre-check/{}/{}/{}?chain_id={}&amount={}",
+        yield_token, eoa_address, spender, chain_id, atomic_str
+    );
+    let pipeline_balance_display = match api
+        .get::<serde_json::Value>(&pre_check_path, Some(&creds.token))
+        .await
+    {
+        Ok(pc) => {
+            let redeemable = pc.get("redeemable").and_then(|v| v.as_bool()).unwrap_or(true);
+            let balance_raw = pc
+                .get("balance")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0");
+            let balance_atomic: u64 = balance_raw.parse().unwrap_or(0);
+            let divisor = 10u64.pow(asset_dec as u32);
+            let balance_human = format!("{:.2}", balance_atomic as f64 / divisor as f64);
+
+            if !redeemable {
+                let reasons = pc
+                    .get("reasons")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|r| r.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+
+                if terse {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "error": "insufficient_balance",
+                            "pipeline_balance": balance_human,
+                            "requested": display_amount,
+                            "reasons": reasons,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "❌ Insufficient balance in DeFi position.\n   Available: ${balance_human}  Requested: ${display_amount}\n   {reasons}"
+                    );
+                }
+                bail!("Insufficient balance: available ${balance_human}, requested ${display_amount}");
+            }
+
+            balance_human
+        }
+        Err(e) => {
+            // Pre-check failed — warn but don't block (may be a new protocol without pre-check)
+            if !terse {
+                println!("⚠️  Could not verify pipeline balance: {e}");
+                println!("   Proceeding anyway — on-chain execution will validate.");
+            }
+            "?".to_string()
+        }
+    };
+
+    if !terse {
+        println!(
+            "Funding ${display_amount} USDC from {protocol_id} on {chain_name} (available: ${pipeline_balance_display}) → wallet..."
+        );
+    }
 
     // Generate a unique invoice ID for this funding operation
     let timestamp = chrono::Utc::now().format("%y%m%d-%H%M%S");
@@ -930,11 +999,7 @@ async fn cmd_fund(
             print!("  Confirming on-chain");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
-        let balance_path = format!(
-            "/v1/x402/balance?chain_id={}",
-            // x402 balance only works for Base (8453) — use that for server wallet checks
-            8453
-        );
+        let balance_path = format!("/v1/x402/balance?chain_id={}", chain_id);
         let mut confirmed: Option<String> = None;
         for attempt in 0..10 {
             if attempt > 0 {
@@ -975,6 +1040,7 @@ async fn cmd_fund(
         let mut json = serde_json::json!({
             "status":       status,
             "amount":       display_amount,
+            "pipeline_balance": pipeline_balance_display,
             "tx_hash":      tx_hash,
             "explorer_url": explorer_url,
             "facto_url":    facto_url,
