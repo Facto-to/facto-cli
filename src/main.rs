@@ -1550,14 +1550,22 @@ fn format_services_terse(items: &[serde_json::Value]) -> String {
                 .parse()
                 .unwrap_or(0);
             let price_usd = raw as f64 / 1_000_000.0;
-            serde_json::json!({
+            let version = item["x402Version"].as_i64().unwrap_or(2);
+            let mut obj = serde_json::json!({
                 "url": item["resource"].as_str().unwrap_or(""),
                 "name": item["name"].as_str().unwrap_or(""),
                 "description": item["description"].as_str().unwrap_or(""),
                 "category": item["category"].as_str().unwrap_or(""),
                 "source": item["source"].as_str().unwrap_or(""),
                 "price_usdc": format!("{:.4}", price_usd),
-            })
+                "x402_version": version,
+            });
+            if raw == 0 {
+                obj["price_note"] = serde_json::Value::String(
+                    "Listed as free but may charge at call time. Use --max-amount to cap.".to_string()
+                );
+            }
+            obj
         })
         .collect();
     serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())
@@ -1598,10 +1606,14 @@ fn format_services_human(items: &[serde_json::Value], total: i64, query: Option<
         } else {
             name
         };
-        out.push_str(&format!("  {} [{}]\n", display_name, source));
+        let version = item["x402Version"].as_i64().unwrap_or(2);
+        let version_badge = if version >= 2 { "v2" } else { "v1" };
+        out.push_str(&format!("  {} [{}] [{}]\n", display_name, source, version_badge));
         out.push_str(&format!("  URL:   {url}\n"));
         if raw > 0 {
             out.push_str(&format!("  Price: ${:.4} USDC\n", price_usd));
+        } else {
+            out.push_str("  Price: $0 (listed) — actual charge may differ\n");
         }
         out.push('\n');
     }

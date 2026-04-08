@@ -61,6 +61,11 @@ pub async fn interactive_service_flow(
 
     let price_display = format_usdc_display(max_amount_atomic);
 
+    if max_amount_atomic == 0 {
+        eprintln!("  ⚠ Listed price is $0 — the service may still charge at call time.");
+        eprintln!("    Use --max-amount to cap spending.\n");
+    }
+
     // Step 3: check balance.
     let balance_resp: Value = api
         .get("/v1/x402/balance?chain_id=8453", Some(token))
@@ -153,6 +158,9 @@ pub async fn confirm_before_pay(
     eprintln!();
     eprintln!("  Target  : {url}");
     eprintln!("  Max cost: {}", format_usdc_display(max_amount));
+    if max_amount == 0 {
+        eprintln!("  ⚠ Listed as free — actual charge may differ");
+    }
     eprintln!("  Balance : {}", format_usdc_display(balance_atomic));
     eprintln!();
 
