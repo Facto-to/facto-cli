@@ -1,5 +1,7 @@
 mod api;
 mod config;
+mod interactive;
+mod pipeline_init;
 
 use anyhow::{bail, Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -85,6 +87,9 @@ enum Commands {
         /// Chain ID. If omitted, auto-detects from your active pipeline.
         #[arg(long)]
         chain: Option<u64>,
+        /// Skip payment confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Check server wallet USDC balance for x402 payments.
@@ -102,6 +107,10 @@ enum Commands {
         /// Filter by category (ai, web, blockchain, data).
         #[arg(long)]
         category: Option<String>,
+
+        /// Interactive mode: select a service and pay directly.
+        #[arg(short, long)]
+        interactive: bool,
     },
 
     /// Configure environment, deposit addresses, and settings.
@@ -160,7 +169,43 @@ async fn main() -> Result<()> {
             max_amount,
             dry_run,
             chain,
+            yes,
         } => {
+            if !yes && !cli.terse && !dry_run {
+                let (api, creds) = api::FactoApi::authenticated()?;
+                ensure_user_bearer_auth(&creds)?;
+
+                let init = pipeline_init::ensure_default_pipeline(
+                    &api,
+                    &creds.token,
+                    cli.terse,
+                )
+                .await
+                .ok();
+                let default_id = init.as_ref().map(|i| i.pipeline_id.as_str());
+
+                // Parse max_amount string to atomic u64 (6-dec USDC).
+                let max_amount_atomic: u64 = max_amount
+                    .as_deref()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|f| (f * 1_000_000.0) as u64)
+                    .unwrap_or(0);
+
+                let proceed = interactive::confirm_before_pay(
+                    &api,
+                    &creds.token,
+                    &url,
+                    max_amount_atomic,
+                    default_id,
+                    cli.terse,
+                )
+                .await?;
+
+                if !proceed {
+                    return Ok(());
+                }
+            }
+
             cmd_pay(
                 &method,
                 &url,
@@ -174,8 +219,31 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Balance { chain } => cmd_balance(chain, cli.terse).await,
-        Commands::Services { query, category } => {
-            cmd_services(query.as_deref(), category.as_deref(), cli.terse).await
+        Commands::Services {
+            query,
+            category,
+            interactive,
+        } => {
+            if interactive {
+                let (api, creds) = api::FactoApi::authenticated()?;
+                ensure_user_bearer_auth(&creds)?;
+                let init = pipeline_init::ensure_default_pipeline(
+                    &api,
+                    &creds.token,
+                    cli.terse,
+                )
+                .await?;
+                interactive::interactive_service_flow(
+                    query.as_deref(),
+                    category.as_deref(),
+                    &api,
+                    &creds.token,
+                    Some(&init.pipeline_id),
+                )
+                .await
+            } else {
+                cmd_services(query.as_deref(), category.as_deref(), cli.terse).await
+            }
         }
         Commands::Config {
             env,
