@@ -302,20 +302,15 @@ async fn check_balance(api: &FactoApi, token: &str) -> Result<String> {
     Ok(format_usdc_display(atomic))
 }
 
-/// Funds the server wallet from the default pipeline.
+/// Funds the server wallet from a pipeline. Handles failures by offering alternatives.
 async fn fund_from_pipeline(
     api: &FactoApi,
     token: &str,
     default_pipeline_id: Option<&str>,
     min_amount_atomic: u64,
 ) -> Result<()> {
-    let pipeline_id = match default_pipeline_id {
-        Some(id) => id.to_string(),
-        None => bail!(
-            "No default pipeline configured. Run `facto pipelines` to set one up, \
-             then use `facto fund` to add balance manually."
-        ),
-    };
+    // Resolve which pipeline to use.
+    let pipeline_id = select_funding_pipeline(api, token, default_pipeline_id).await?;
 
     // Suggest $5.00 or the minimum required amount, whichever is larger.
     let suggested_atomic = min_amount_atomic.max(5_000_000); // $5.00 in 6-dec
@@ -341,7 +336,116 @@ async fn fund_from_pipeline(
         bail!("Amount must be positive.");
     }
 
-    // Fetch pipeline details to get asset_decimals.
+    // Try to execute the fund — if it fails, offer recovery options.
+    match try_fund(api, token, &pipeline_id, amount_human).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!();
+            eprintln!("  ❌ Funding failed: {msg}");
+            eprintln!();
+            eprintln!("  Options:");
+            eprintln!("    [1] Try a different pipeline");
+            eprintln!("    [2] Complete authorization at {}/pipelines", crate::pipeline_init::frontend_url());
+            eprintln!("    [3] Exit");
+            eprintln!();
+
+            loop {
+                eprint!("  Choose (1–3): ");
+                std::io::stderr().flush().ok();
+                let mut choice = String::new();
+                std::io::stdin().read_line(&mut choice).ok();
+                match choice.trim() {
+                    "1" => {
+                        // List all pipelines and let user pick a different one.
+                        let alt_id = select_funding_pipeline(api, token, None).await?;
+                        return try_fund(api, token, &alt_id, amount_human).await;
+                    }
+                    "2" => {
+                        let url = format!("{}/pipelines/{pipeline_id}", crate::pipeline_init::frontend_url());
+                        eprintln!("  Opening: {url}");
+                        let _ = open::that(&url);
+                        bail!("Complete the authorization in your browser, then retry.");
+                    }
+                    "3" => {
+                        bail!("Funding cancelled.");
+                    }
+                    _ => {
+                        eprintln!("  Please enter 1, 2, or 3.");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve which pipeline to fund from. Shows a selection list if no default or if explicit_id is None.
+async fn select_funding_pipeline(
+    api: &FactoApi,
+    token: &str,
+    preferred_id: Option<&str>,
+) -> Result<String> {
+    if let Some(id) = preferred_id {
+        // Verify it exists.
+        let route: Result<Value> = api.get(&format!("/v1/routes/{id}"), Some(token)).await;
+        if let Ok(r) = route {
+            if r["status"].as_str() == Some("active") {
+                let name = r["name"].as_str().unwrap_or(id);
+                let chain = r["chain_id"].as_u64().unwrap_or(0);
+                let asset = r["asset_symbol"].as_str().unwrap_or("?");
+                eprintln!("  Using pipeline: {name} ({asset} on chain {chain})");
+                return Ok(id.to_string());
+            }
+        }
+        eprintln!("  Default pipeline {id} is not available. Listing alternatives…");
+    }
+
+    // Fetch all active pipelines.
+    let routes: Vec<Value> = api
+        .get("/v1/routes/me", Some(token))
+        .await
+        .context("Failed to fetch pipelines")?;
+
+    let active: Vec<&Value> = routes
+        .iter()
+        .filter(|r| r["status"].as_str() == Some("active"))
+        .collect();
+
+    if active.is_empty() {
+        bail!(
+            "No active pipelines found. Create one at {}/pipelines",
+            crate::pipeline_init::frontend_url()
+        );
+    }
+
+    eprintln!();
+    eprintln!("  Available pipelines:");
+    for (i, r) in active.iter().enumerate() {
+        let name = r["name"].as_str().unwrap_or("unnamed");
+        let chain = r["chain_id"].as_u64().unwrap_or(0);
+        let asset = r["asset_symbol"].as_str().unwrap_or("?");
+        let protocol = r["protocol_id"].as_str().unwrap_or("?");
+        eprintln!("    [{}] {} — {} {} (chain {})", i + 1, name, protocol, asset, chain);
+    }
+    eprintln!();
+
+    loop {
+        eprint!("  Select pipeline (1–{}): ", active.len());
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if let Ok(n) = line.trim().parse::<usize>() {
+            if n >= 1 && n <= active.len() {
+                let id = active[n - 1]["id"].as_str().unwrap_or("").to_string();
+                return Ok(id);
+            }
+        }
+        eprintln!("  Please enter a number between 1 and {}.", active.len());
+    }
+}
+
+/// Attempt the actual fund operation.
+async fn try_fund(api: &FactoApi, token: &str, pipeline_id: &str, amount_human: f64) -> Result<()> {
     let route: Value = api
         .get(&format!("/v1/routes/{pipeline_id}"), Some(token))
         .await
@@ -349,7 +453,6 @@ async fn fund_from_pipeline(
 
     let asset_decimals = route["asset_decimals"].as_u64().unwrap_or(6) as u32;
 
-    // Fetch server wallet address from /v1/auth/me.
     let me: Value = api
         .get("/v1/auth/me", Some(token))
         .await
@@ -363,20 +466,18 @@ async fn fund_from_pipeline(
         .to_string();
 
     if server_wallet.is_empty() {
-        bail!("Could not determine server wallet address from /v1/auth/me.");
+        bail!("Could not determine server wallet address.");
     }
 
-    // Convert to atomic units.
     let factor = 10u64.pow(asset_decimals);
     let amount_atomic = (amount_human * factor as f64).round() as u64;
 
-    // Generate invoice_id: CLI-FUND-{YYMMDDHHMMSS}-{4hex}
     let now = chrono::Utc::now();
     let ts = now.format("%y%m%d%H%M%S");
     let rnd = rand_u16();
     let invoice_id = format!("CLI-FUND-{ts}-{rnd:04x}");
 
-    eprintln!("Funding ${amount_human:.2} USDC from pipeline {pipeline_id}…");
+    eprintln!("  Funding ${amount_human:.2} USDC from pipeline {pipeline_id}…");
 
     let asset_symbol = route["asset_symbol"].as_str().unwrap_or("USDC").to_string();
 
@@ -392,11 +493,11 @@ async fn fund_from_pipeline(
     let _: Value = api
         .post_authenticated("/v1/charges/execute-7702", &payload, token)
         .await
-        .context("Failed to execute funding charge")?;
+        .context("Funding failed")?;
 
-    eprintln!("Funding submitted. Waiting 5 seconds for balance to reflect…");
+    eprintln!("  Funding submitted. Waiting for balance…");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    eprintln!("Done.");
+    eprintln!("  ✓ Done.");
     Ok(())
 }
 
