@@ -212,6 +212,7 @@ async fn main() -> Result<()> {
                     .map(|f| (f * 1_000_000.0) as u64)
                     .unwrap_or(0);
 
+                let confirm_chain = chain.unwrap_or(8453);
                 let proceed = interactive::confirm_before_pay(
                     &api,
                     &creds.token,
@@ -219,6 +220,7 @@ async fn main() -> Result<()> {
                     max_amount_atomic,
                     default_id,
                     cli.terse,
+                    confirm_chain,
                 )
                 .await?;
 

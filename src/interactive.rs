@@ -47,6 +47,7 @@ pub async fn interactive_service_flow(
         .to_string();
 
     let method = service["method"].as_str().unwrap_or("GET").to_string();
+    let chain_id = parse_chain_id_from_service(service);
 
     // Extract price from accepts[0].maxAmountRequired (atomic USDC, 6 dec).
     let max_amount_atomic: u64 = service["accepts"]
@@ -67,9 +68,9 @@ pub async fn interactive_service_flow(
         eprintln!("    Use --max-amount to cap spending.\n");
     }
 
-    // Step 3: check balance.
+    // Step 3: check balance on service's chain.
     let balance_resp: Value = api
-        .get("/v1/x402/balance?chain_id=8453", Some(token))
+        .get(&format!("/v1/x402/balance?chain_id={chain_id}"), Some(token))
         .await
         .context("Failed to fetch balance")?;
 
@@ -106,7 +107,7 @@ pub async fn interactive_service_flow(
     let pay_body = serde_json::json!({
         "url": url,
         "method": method,
-        "chain_id": 8453,
+        "chain_id": chain_id,
         "max_amount": max_amount_atomic.to_string(),
     });
 
@@ -142,15 +143,16 @@ pub async fn confirm_before_pay(
     max_amount: u64,
     default_pipeline_id: Option<&str>,
     terse: bool,
+    chain_id: u64,
 ) -> Result<bool> {
     // Agent / terse mode: skip all prompts.
     if terse {
         return Ok(true);
     }
 
-    // Check balance.
+    // Check balance on the target chain.
     let balance_resp: Value = api
-        .get("/v1/x402/balance?chain_id=8453", Some(token))
+        .get(&format!("/v1/x402/balance?chain_id={chain_id}"), Some(token))
         .await
         .context("Failed to fetch balance")?;
 
@@ -308,9 +310,9 @@ fn prompt_yn(question: &str) -> Result<bool> {
 
 /// Fetches the server wallet balance and returns a display string.
 #[allow(dead_code)]
-async fn check_balance(api: &FactoApi, token: &str) -> Result<String> {
+async fn check_balance(api: &FactoApi, token: &str, chain_id: u64) -> Result<String> {
     let resp: Value = api
-        .get("/v1/x402/balance?chain_id=8453", Some(token))
+        .get(&format!("/v1/x402/balance?chain_id={chain_id}"), Some(token))
         .await
         .context("Failed to fetch balance")?;
     let atomic = parse_balance_atomic(&resp);
@@ -547,6 +549,27 @@ fn parse_balance_atomic(resp: &Value) -> u64 {
         }
     }
     0
+}
+
+/// Parse chain_id from a service's network field.
+/// Handles: "eip155:8453", "base", "eip155:143", "monad", "base-sepolia", etc.
+/// Defaults to 8453 (Base) if unrecognized.
+fn parse_chain_id_from_service(service: &Value) -> u64 {
+    let network = service["accepts"]
+        .get(0)
+        .and_then(|a| a["network"].as_str())
+        .or_else(|| service["network"].as_str())
+        .unwrap_or("base");
+
+    match network {
+        "base" | "eip155:8453" => 8453,
+        "monad" | "eip155:143" => 143,
+        "base-sepolia" | "eip155:84532" => 84532,
+        other if other.starts_with("eip155:") => {
+            other.strip_prefix("eip155:").and_then(|s| s.parse().ok()).unwrap_or(8453)
+        }
+        _ => 8453,
+    }
 }
 
 /// Converts atomic USDC (6 dec) to a human-readable f64.
