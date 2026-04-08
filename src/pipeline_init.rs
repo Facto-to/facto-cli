@@ -201,7 +201,7 @@ pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -
     // ── Step 3a: no Base routes ──────────────────────────────────────────
     if base_routes.is_empty() {
         let create_url = format!(
-            "{}/pipelines/create?chain=base&source=cli",
+            "{}/pipelines?source=cli&chain=base",
             frontend_url()
         );
 
