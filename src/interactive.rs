@@ -39,8 +39,9 @@ pub async fn interactive_service_flow(
     let idx = prompt_selection(&items)?;
     let service = &items[idx];
 
-    let url = service["url"]
+    let url = service["resource"]
         .as_str()
+        .or_else(|| service["url"].as_str())
         .or_else(|| service["endpoint"].as_str())
         .unwrap_or("")
         .to_string();
@@ -274,9 +275,12 @@ fn prompt_selection(items: &[Value]) -> Result<usize> {
         eprint!("Select service (1–{}): ", items.len());
         std::io::stderr().flush().ok();
         let mut line = String::new();
-        std::io::stdin()
+        let bytes = std::io::stdin()
             .read_line(&mut line)
             .context("Failed to read user input")?;
+        if bytes == 0 {
+            bail!("No selection (stdin closed).");
+        }
         let trimmed = line.trim();
         if let Ok(n) = trimmed.parse::<usize>() {
             if n >= 1 && n <= items.len() {
@@ -292,9 +296,12 @@ fn prompt_yn(question: &str) -> Result<bool> {
     eprint!("{question} ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
-    std::io::stdin()
+    let bytes = std::io::stdin()
         .read_line(&mut line)
         .context("Failed to read user input")?;
+    if bytes == 0 {
+        return Ok(false); // EOF → treat as "no"
+    }
     let answer = line.trim().to_lowercase();
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
@@ -362,7 +369,10 @@ async fn fund_from_pipeline(
                 eprint!("  Choose (1–3): ");
                 std::io::stderr().flush().ok();
                 let mut choice = String::new();
-                std::io::stdin().read_line(&mut choice).ok();
+                let bytes = std::io::stdin().read_line(&mut choice).unwrap_or(0);
+                if bytes == 0 {
+                    bail!("Funding cancelled (no input).");
+                }
                 match choice.trim() {
                     "1" => {
                         // List all pipelines and let user pick a different one.
@@ -441,7 +451,10 @@ async fn select_funding_pipeline(
         eprint!("  Select pipeline (1–{}): ", active.len());
         std::io::stderr().flush().ok();
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
+        let bytes = std::io::stdin().read_line(&mut line).unwrap_or(0);
+        if bytes == 0 {
+            bail!("No pipeline selected (no input).");
+        }
         if let Ok(n) = line.trim().parse::<usize>() {
             if n >= 1 && n <= active.len() {
                 let id = active[n - 1]["id"].as_str().unwrap_or("").to_string();
@@ -511,28 +524,27 @@ async fn try_fund(api: &FactoApi, token: &str, pipeline_id: &str, amount_human: 
 
 /// Converts atomic USDC (6 decimals) to `"$X.XX"` display string.
 pub fn format_usdc_display(atomic: u64) -> String {
-    let dollars = atomic / 1_000_000;
-    let cents = (atomic % 1_000_000) / 10_000;
-    format!("${dollars}.{cents:02}")
+    let whole = atomic / 1_000_000;
+    let frac = atomic % 1_000_000;
+    // Show 4 decimal places to capture sub-cent prices (e.g. $0.0020)
+    let frac_4 = frac / 100; // 6 dec → 4 dec
+    format!("${whole}.{frac_4:04}")
 }
 
 // ── Internal utilities ────────────────────────────────────────────────────────
 
 /// Parses the numeric balance (atomic, 6-dec USDC) from a balance response.
 fn parse_balance_atomic(resp: &Value) -> u64 {
-    // Try `balance` field as string first, then as number.
-    if let Some(s) = resp["balance"].as_str() {
-        return s.parse::<u64>().unwrap_or(0);
-    }
-    if let Some(n) = resp["balance"].as_u64() {
-        return n;
-    }
-    // Some endpoints return `{ "usdc": "1234567" }` style.
-    if let Some(s) = resp["usdc"].as_str() {
-        return s.parse::<u64>().unwrap_or(0);
-    }
-    if let Some(n) = resp["usdc"].as_u64() {
-        return n;
+    // The balance API returns { "usdc_balance": "945000", ... }
+    for key in &["usdc_balance", "balance", "usdc"] {
+        if let Some(s) = resp[key].as_str() {
+            if let Ok(n) = s.parse::<u64>() {
+                return n;
+            }
+        }
+        if let Some(n) = resp[key].as_u64() {
+            return n;
+        }
     }
     0
 }
