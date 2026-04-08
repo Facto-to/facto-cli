@@ -21,6 +21,20 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum PipelineAction {
+    /// Show details of a specific pipeline.
+    Show {
+        /// Pipeline (route) ID.
+        id: String,
+    },
+    /// Set or view the default pipeline for x402 payments.
+    Default {
+        /// Pipeline ID to set as default. Omit to show current default.
+        id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Commands {
     /// Authenticate via browser (Privy OAuth) or dev token.
     Login {
@@ -38,8 +52,11 @@ enum Commands {
     /// Show the currently authenticated account.
     Whoami,
 
-    /// List DeFi pipelines with available balance and limits.
-    Pipelines,
+    /// Manage DeFi pipelines: list, view details, or set default.
+    Pipelines {
+        #[command(subcommand)]
+        action: Option<PipelineAction>,
+    },
 
     /// Withdraw USDC from a DeFi position and send to a recipient.
     Fund {
@@ -144,7 +161,11 @@ async fn main() -> Result<()> {
             dev_token,
         } => cmd_login(cli.terse, api_key, signing_key, dev_token).await,
         Commands::Whoami => cmd_whoami(cli.terse).await,
-        Commands::Pipelines => cmd_pipelines(cli.terse).await,
+        Commands::Pipelines { action } => match action {
+            None => cmd_pipelines(cli.terse).await,
+            Some(PipelineAction::Show { id }) => cmd_pipeline_show(&id, cli.terse).await,
+            Some(PipelineAction::Default { id }) => cmd_pipeline_default(id.as_deref(), cli.terse).await,
+        },
         Commands::Fund {
             amount,
             to,
@@ -725,6 +746,90 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
             println!("  Limits:     ${per_tx} per tx / ${daily} daily");
             println!("  Status:     {status_display}");
             println!();
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_pipeline_show(route_id: &str, terse: bool) -> Result<()> {
+    let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
+
+    let route: serde_json::Value = api
+        .get(&format!("/v1/routes/{route_id}"), Some(&creds.token))
+        .await
+        .context("Failed to fetch pipeline details")?;
+
+    if terse {
+        println!("{}", serde_json::to_string(&route)?);
+    } else {
+        let name = route["name"].as_str().unwrap_or("Unnamed");
+        let chain_id = route["chain_id"].as_u64().unwrap_or(0);
+        let protocol = route["protocol_id"].as_str().unwrap_or("?");
+        let asset = route["asset_symbol"].as_str().unwrap_or("?");
+        let eoa = route["eoa_address"].as_str().unwrap_or("?");
+        let status = route["status"].as_str().unwrap_or("?");
+        let per_tx = route["spending_limit"].as_str().unwrap_or("0");
+        let daily = route["daily_limit"].as_str().unwrap_or("0");
+        let spend_mode = route["spend_mode"].as_str().unwrap_or("withdraw");
+        let refund = route["refund_address"].as_str().unwrap_or("(default)");
+
+        println!("Pipeline: {} ({})", name, route_id);
+        println!("  Chain:         {}", chain_display_name(chain_id));
+        println!("  Protocol:      {}", protocol);
+        println!("  Asset:         {}", asset);
+        println!("  Spend Mode:    {}", spend_mode);
+        println!("  EOA:           {}", eoa);
+        println!("  Refund To:     {}", refund);
+        println!("  Per-tx Limit:  ${}", per_tx);
+        println!("  Daily Limit:   ${}", daily);
+        println!("  Status:        {}", if status == "active" { "✅ Active" } else { status });
+    }
+
+    Ok(())
+}
+
+async fn cmd_pipeline_default(id: Option<&str>, terse: bool) -> Result<()> {
+    let (api, creds) = api::FactoApi::authenticated()?;
+    ensure_user_bearer_auth(&creds)?;
+
+    match id {
+        Some(pipeline_id) => {
+            // Set default
+            let body = serde_json::json!({ "default_pipeline_id": pipeline_id });
+            let resp: serde_json::Value = api
+                .put_authenticated("/v1/user/preferences", &body, &creds.token)
+                .await
+                .context("Failed to set default pipeline")?;
+
+            // Update local cache
+            let mut cfg = config::load_config();
+            cfg.default_pipeline_id = Some(pipeline_id.to_string());
+            cfg.default_pipeline_cached_at = Some(chrono::Utc::now());
+            let _ = config::save_config(&cfg);
+
+            if terse {
+                println!("{}", serde_json::to_string(&resp)?);
+            } else {
+                println!("✓ Default pipeline set to {}", pipeline_id);
+            }
+        }
+        None => {
+            // Show current default
+            let prefs: serde_json::Value = api
+                .get("/v1/user/preferences", Some(&creds.token))
+                .await
+                .context("Failed to fetch preferences")?;
+
+            if terse {
+                println!("{}", serde_json::to_string(&prefs)?);
+            } else {
+                match prefs["default_pipeline_id"].as_str() {
+                    Some(id) => println!("Default pipeline: {}", id),
+                    None => println!("No default pipeline set. Use: facto pipelines default <ID>"),
+                }
+            }
         }
     }
 
