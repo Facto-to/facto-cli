@@ -81,6 +81,26 @@ impl FactoApi {
         self.parse_response(resp).await
     }
 
+    /// Sends an authenticated PUT request (Bearer token) with a JSON body.
+    pub async fn put_authenticated<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+        token: &str,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(token)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("PUT {url} failed"))?;
+
+        self.parse_response(resp).await
+    }
+
     /// Sends an authenticated POST request using HMAC headers with a JSON body.
     #[allow(dead_code)]
     pub async fn post_hmac<T: DeserializeOwned>(

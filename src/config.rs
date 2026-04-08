@@ -90,6 +90,12 @@ pub struct AppConfig {
     /// Custom API URLs per environment (overrides built-in defaults)
     #[serde(default)]
     pub api_urls: std::collections::HashMap<String, String>,
+    /// Cached default pipeline ID (synced from backend).
+    #[serde(default)]
+    pub default_pipeline_id: Option<String>,
+    /// When the pipeline cache was last refreshed.
+    #[serde(default)]
+    pub default_pipeline_cached_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_env() -> String {
@@ -101,6 +107,8 @@ impl Default for AppConfig {
         Self {
             env: default_env(),
             api_urls: std::collections::HashMap::new(),
+            default_pipeline_id: None,
+            default_pipeline_cached_at: None,
         }
     }
 }
