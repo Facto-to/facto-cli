@@ -571,7 +571,7 @@ async fn resolve_chain_id(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No active pipeline found. Cannot auto-detect chain.\n\
-                 Specify --chain <ID> explicitly, or create a pipeline at https://facto.xyz"
+                 Specify --chain <ID> explicitly, or create a pipeline at {}/pipelines", pipeline_init::frontend_url()
             )
         })?;
 
@@ -638,7 +638,7 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
                 serde_json::to_string(&serde_json::json!({"pipelines": []}))?
             );
         } else {
-            println!("No active pipelines found. Create one at https://facto.xyz/dashboard");
+            println!("No active pipelines found. Create one at {}/pipelines", pipeline_init::frontend_url());
         }
         return Ok(());
     }
@@ -893,7 +893,7 @@ async fn cmd_fund(
                     .map(|id| chain_display_name(*id))
                     .collect();
                 bail!(
-                    "No active pipeline on a supported chain. Currently supported: {}.\nRun `facto pipelines` to see your pipelines or create one at https://facto.xyz/dashboard",
+                    "No active pipeline on a supported chain. Currently supported: {}.\nRun `facto pipelines` to see your pipelines or create one at {}/pipelines", pipeline_init::frontend_url(),
                     supported.join(", ")
                 );
             }
@@ -1173,7 +1173,7 @@ async fn cmd_fund(
         _ => "https://etherscan.io",
     };
     let explorer_url = format!("{explorer_base}/tx/{tx_hash}");
-    let facto_url = format!("https://facto.xyz/charges/{charge_id}");
+    let facto_url = format!("{}/charges/{charge_id}", pipeline_init::frontend_url());
 
     // Confirm balance arrived on-chain (poll up to ~30s)
     let confirmed_balance = if resolved_recipient == user_wallet {

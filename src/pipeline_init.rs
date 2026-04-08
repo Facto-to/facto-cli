@@ -108,11 +108,11 @@ async fn set_default(
 
 // ── Frontend URL helper ───────────────────────────────────────────────────
 
-fn frontend_url() -> &'static str {
+pub fn frontend_url() -> &'static str {
     let cfg = config::load_config();
     match cfg.env.as_str() {
         "prod" => "https://facto.xyz",
-        _ => "https://dev.facto.xyz",
+        _ => "https://facto-pay-monad-advanced.vercel.app",
     }
 }
 
