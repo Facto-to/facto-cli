@@ -1553,6 +1553,7 @@ fn format_services_terse(items: &[serde_json::Value]) -> String {
                 .unwrap_or(0);
             let price_usd = raw as f64 / 1_000_000.0;
             let version = item["x402Version"].as_i64().unwrap_or(2);
+            let method = item["method"].as_str().unwrap_or("GET");
             let mut obj = serde_json::json!({
                 "url": item["resource"].as_str().unwrap_or(""),
                 "name": item["name"].as_str().unwrap_or(""),
@@ -1560,8 +1561,18 @@ fn format_services_terse(items: &[serde_json::Value]) -> String {
                 "category": item["category"].as_str().unwrap_or(""),
                 "source": item["source"].as_str().unwrap_or(""),
                 "price_usdc": format!("{:.4}", price_usd),
+                "method": method,
                 "x402_version": version,
             });
+            // Include required_params and example_request when available
+            if let Some(params) = item.get("requiredParams") {
+                if !params.is_null() {
+                    obj["required_params"] = params.clone();
+                }
+            }
+            if let Some(example) = item["exampleRequest"].as_str() {
+                obj["example"] = serde_json::Value::String(example.to_string());
+            }
             if raw == 0 {
                 obj["price_note"] = serde_json::Value::String(
                     "Listed as free but may charge at call time. Use --max-amount to cap.".to_string()
