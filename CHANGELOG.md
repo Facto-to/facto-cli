@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-04-09
+
+### Fixed
+
+- `facto balance` and `facto pay` now honor the selected default pipeline when `--chain` is omitted instead of always using the first active pipeline
+- Default pipeline cache is refreshed from backend preferences before auto-selecting the chain, keeping CLI behavior aligned with the user's current pipeline selection
+- Release CI is clean again: remove the unused `chain_id` field from pipeline init results and resolve the Clippy warning in interactive confirmation flow
+
+### Changed
+
+- README now documents `facto pipelines default [ID]` and clarifies how auto-selected chains work for `balance` and `pay`
+
 ## [0.3.1] - 2026-04-07
 
 ### Fixed
@@ -75,6 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
+[0.5.3]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.3
 [0.3.1]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.2.0

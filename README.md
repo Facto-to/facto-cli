@@ -61,9 +61,10 @@ facto services "weather"
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
 | `facto whoami` | Show current account and pipeline count |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
+| `facto pipelines default [ID]` | Show or set the default pipeline used for auto-selected x402 chains |
 | `facto fund --amount N` | Withdraw N USDC from a DeFi position to your wallet |
 | `facto pay METHOD URL` | Call an API with automatic x402 payment handling |
-| `facto balance` | Check server wallet USDC balance on a given chain |
+| `facto balance` | Check server wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto services [query]` | Discover x402-enabled services, optionally filtered by keyword |
 | `facto history` | Show past funding and payment transactions |
 | `facto config` | Configure deposit addresses for cross-chain transfers |
@@ -116,14 +117,20 @@ facto -t services "weather"
 # Check balance
 facto -t balance
 # => {"usdc_balance_display":"$0.0500",...}
+
+# Pin the pipeline used by auto-selected balance/pay commands
+facto pipelines default <PIPELINE_ID>
 ```
+
+When `--chain` is omitted, `facto balance` and `facto pay` now prefer your selected default pipeline. If no default is set or it is no longer active, the CLI falls back to the first active pipeline.
 
 ### Typical Agent Workflow
 
 1. `facto -t services "<keyword>"` — find the right API
 2. `facto -t pay GET "<url>"` — call and parse the response
 3. If balance is low: `facto fund --amount 5` — auto-selects pipeline
-4. `facto -t pipelines` — inspect DeFi pipeline balance if needed
+4. `facto pipelines default <ID>` — pin the pipeline/chain used by `balance` and `pay`
+5. `facto -t pipelines` — inspect DeFi pipeline balance if needed
 
 ## Configuration
 

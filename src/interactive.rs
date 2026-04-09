@@ -70,7 +70,10 @@ pub async fn interactive_service_flow(
 
     // Step 3: check balance on service's chain.
     let balance_resp: Value = api
-        .get(&format!("/v1/x402/balance?chain_id={chain_id}"), Some(token))
+        .get(
+            &format!("/v1/x402/balance?chain_id={chain_id}"),
+            Some(token),
+        )
         .await
         .context("Failed to fetch balance")?;
 
@@ -152,7 +155,10 @@ pub async fn confirm_before_pay(
 
     // Check balance on the target chain.
     let balance_resp: Value = api
-        .get(&format!("/v1/x402/balance?chain_id={chain_id}"), Some(token))
+        .get(
+            &format!("/v1/x402/balance?chain_id={chain_id}"),
+            Some(token),
+        )
         .await
         .context("Failed to fetch balance")?;
 
@@ -178,7 +184,7 @@ pub async fn confirm_before_pay(
         }
     }
 
-    Ok(prompt_yn("Proceed with payment? [Y/n]")?)
+    prompt_yn("Proceed with payment? [Y/n]")
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -312,7 +318,10 @@ fn prompt_yn(question: &str) -> Result<bool> {
 #[allow(dead_code)]
 async fn check_balance(api: &FactoApi, token: &str, chain_id: u64) -> Result<String> {
     let resp: Value = api
-        .get(&format!("/v1/x402/balance?chain_id={chain_id}"), Some(token))
+        .get(
+            &format!("/v1/x402/balance?chain_id={chain_id}"),
+            Some(token),
+        )
         .await
         .context("Failed to fetch balance")?;
     let atomic = parse_balance_atomic(&resp);
@@ -363,7 +372,10 @@ async fn fund_from_pipeline(
             eprintln!();
             eprintln!("  Options:");
             eprintln!("    [1] Try a different pipeline");
-            eprintln!("    [2] Complete authorization at {}/pipelines", crate::pipeline_init::frontend_url());
+            eprintln!(
+                "    [2] Complete authorization at {}/pipelines",
+                crate::pipeline_init::frontend_url()
+            );
             eprintln!("    [3] Exit");
             eprintln!();
 
@@ -382,7 +394,10 @@ async fn fund_from_pipeline(
                         return try_fund(api, token, &alt_id, amount_human).await;
                     }
                     "2" => {
-                        let url = format!("{}/pipelines/{pipeline_id}", crate::pipeline_init::frontend_url());
+                        let url = format!(
+                            "{}/pipelines/{pipeline_id}",
+                            crate::pipeline_init::frontend_url()
+                        );
                         eprintln!("  Opening: {url}");
                         let _ = open::that(&url);
                         bail!("Complete the authorization in your browser, then retry.");
@@ -445,7 +460,14 @@ async fn select_funding_pipeline(
         let chain = r["chain_id"].as_u64().unwrap_or(0);
         let asset = r["asset_symbol"].as_str().unwrap_or("?");
         let protocol = r["protocol_id"].as_str().unwrap_or("?");
-        eprintln!("    [{}] {} — {} {} (chain {})", i + 1, name, protocol, asset, chain);
+        eprintln!(
+            "    [{}] {} — {} {} (chain {})",
+            i + 1,
+            name,
+            protocol,
+            asset,
+            chain
+        );
     }
     eprintln!();
 
@@ -565,9 +587,10 @@ fn parse_chain_id_from_service(service: &Value) -> u64 {
         "base" | "eip155:8453" => 8453,
         "monad" | "eip155:143" => 143,
         "base-sepolia" | "eip155:84532" => 84532,
-        other if other.starts_with("eip155:") => {
-            other.strip_prefix("eip155:").and_then(|s| s.parse().ok()).unwrap_or(8453)
-        }
+        other if other.starts_with("eip155:") => other
+            .strip_prefix("eip155:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8453),
         _ => 8453,
     }
 }

@@ -12,7 +12,6 @@ use crate::config;
 /// Result of a successful pipeline resolution.
 pub struct InitResult {
     pub pipeline_id: String,
-    pub chain_id: u64,
 }
 
 // ── Backend response shapes ───────────────────────────────────────────────
@@ -84,11 +83,7 @@ async fn fetch_my_routes(api: &FactoApi, token: &str) -> Result<Vec<RouteRespons
 }
 
 /// Persist the chosen pipeline ID as the default on the backend and in local cache.
-async fn set_default(
-    api: &FactoApi,
-    token: &str,
-    pipeline_id: &str,
-) -> Result<()> {
+async fn set_default(api: &FactoApi, token: &str, pipeline_id: &str) -> Result<()> {
     let body = SetDefaultPipeline {
         default_pipeline_id: pipeline_id.to_string(),
     };
@@ -142,7 +137,11 @@ fn prompt_choice(label: &str, max: usize) -> Result<usize> {
 /// * `api`   — authenticated API client
 /// * `token` — Bearer token for API calls
 /// * `terse` — when `true`, skip interactive prompts and bail with an error instead
-pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -> Result<InitResult> {
+pub async fn ensure_default_pipeline(
+    api: &FactoApi,
+    token: &str,
+    terse: bool,
+) -> Result<InitResult> {
     // ── Step 1: check local cache ────────────────────────────────────────
     let cfg = config::load_config();
     if let (Some(cached_id), Some(cached_at)) =
@@ -152,10 +151,7 @@ pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -
             // Validate the cached route is still active on the backend.
             match fetch_route(api, token, cached_id).await? {
                 Some(r) if is_valid_base_route(&r) => {
-                    return Ok(InitResult {
-                        pipeline_id: r.id,
-                        chain_id: r.chain_id,
-                    });
+                    return Ok(InitResult { pipeline_id: r.id });
                 }
                 _ => {
                     // Stale or invalid — clear cache and fall through.
@@ -179,10 +175,7 @@ pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -
                     cfg2.default_pipeline_cached_at = Some(chrono::Utc::now());
                     let _ = config::save_config(&cfg2);
 
-                    return Ok(InitResult {
-                        pipeline_id: r.id,
-                        chain_id: r.chain_id,
-                    });
+                    return Ok(InitResult { pipeline_id: r.id });
                 }
             }
         }
@@ -193,22 +186,15 @@ pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -
         .await
         .context("Failed to fetch routes")?;
 
-    let mut base_routes: Vec<RouteResponse> = all_routes
-        .into_iter()
-        .filter(is_valid_base_route)
-        .collect();
+    let mut base_routes: Vec<RouteResponse> =
+        all_routes.into_iter().filter(is_valid_base_route).collect();
 
     // ── Step 3a: no Base routes ──────────────────────────────────────────
     if base_routes.is_empty() {
-        let create_url = format!(
-            "{}/pipelines?source=cli&chain=base",
-            frontend_url()
-        );
+        let create_url = format!("{}/pipelines?source=cli&chain=base", frontend_url());
 
         if terse {
-            bail!(
-                "No active Base pipeline found. Create one at: {create_url}"
-            );
+            bail!("No active Base pipeline found. Create one at: {create_url}");
         }
 
         // Interactive: open browser and poll.
@@ -239,15 +225,12 @@ pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -
         set_default(api, token, &route.id).await?;
         return Ok(InitResult {
             pipeline_id: route.id,
-            chain_id: 8453,
         });
     }
 
     // ── Step 3c: multiple Base routes ────────────────────────────────────
     if terse {
-        bail!(
-            "Multiple Base pipelines found. Specify one with --pipeline <id>."
-        );
+        bail!("Multiple Base pipelines found. Specify one with --pipeline <id>.");
     }
 
     // Interactive: display numbered list and prompt.
@@ -262,6 +245,5 @@ pub async fn ensure_default_pipeline(api: &FactoApi, token: &str, terse: bool) -
 
     Ok(InitResult {
         pipeline_id: chosen.id,
-        chain_id: 8453,
     })
 }

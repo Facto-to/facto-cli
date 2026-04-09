@@ -163,7 +163,10 @@ async fn main() -> Result<()> {
 
     // Startup update check: only in interactive (TTY) non-terse mode,
     // skip for upgrade command itself, throttled to every 4 hours.
-    if !cli.terse && atty::is(atty::Stream::Stderr) && !matches!(cli.command, Commands::Upgrade { .. }) {
+    if !cli.terse
+        && atty::is(atty::Stream::Stderr)
+        && !matches!(cli.command, Commands::Upgrade { .. })
+    {
         if let Some(latest) = check_update_throttled().await {
             let current = env!("CARGO_PKG_VERSION");
             if latest != current {
@@ -184,7 +187,9 @@ async fn main() -> Result<()> {
         Commands::Pipelines { action } => match action {
             None => cmd_pipelines(cli.terse).await,
             Some(PipelineAction::Show { id }) => cmd_pipeline_show(&id, cli.terse).await,
-            Some(PipelineAction::Default { id }) => cmd_pipeline_default(id.as_deref(), cli.terse).await,
+            Some(PipelineAction::Default { id }) => {
+                cmd_pipeline_default(id.as_deref(), cli.terse).await
+            }
         },
         Commands::Fund {
             amount,
@@ -216,13 +221,9 @@ async fn main() -> Result<()> {
                 let (api, creds) = api::FactoApi::authenticated()?;
                 ensure_user_bearer_auth(&creds)?;
 
-                let init = pipeline_init::ensure_default_pipeline(
-                    &api,
-                    &creds.token,
-                    cli.terse,
-                )
-                .await
-                .ok();
+                let init = pipeline_init::ensure_default_pipeline(&api, &creds.token, cli.terse)
+                    .await
+                    .ok();
                 let default_id = init.as_ref().map(|i| i.pipeline_id.as_str());
 
                 // Parse max_amount string to atomic u64 (6-dec USDC).
@@ -270,12 +271,8 @@ async fn main() -> Result<()> {
             if interactive {
                 let (api, creds) = api::FactoApi::authenticated()?;
                 ensure_user_bearer_auth(&creds)?;
-                let init = pipeline_init::ensure_default_pipeline(
-                    &api,
-                    &creds.token,
-                    cli.terse,
-                )
-                .await?;
+                let init =
+                    pipeline_init::ensure_default_pipeline(&api, &creds.token, cli.terse).await?;
                 interactive::interactive_service_flow(
                     query.as_deref(),
                     category.as_deref(),
@@ -566,41 +563,83 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolves chain_id: uses explicit value if provided, otherwise auto-detects
-/// from the user's first active pipeline.
-async fn resolve_chain_id(
+fn is_active_route(route: &serde_json::Value) -> bool {
+    route["status"]
+        .as_str()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("active")
+}
+
+fn resolve_chain_id_from_routes(
     explicit: Option<u64>,
-    api: &api::FactoApi,
-    token: &str,
+    routes: &[serde_json::Value],
+    preferred_pipeline_id: Option<&str>,
 ) -> Result<u64> {
     if let Some(id) = explicit {
         return Ok(id);
     }
 
-    // Fetch routes and find first active one
-    let routes: Vec<serde_json::Value> = api
-        .get("/v1/routes/me", Some(token))
-        .await
-        .context("Failed to fetch routes for chain auto-detection")?;
+    if let Some(preferred_id) = preferred_pipeline_id {
+        if let Some(selected) = routes.iter().find(|route| {
+            is_active_route(route) && route["id"].as_str().unwrap_or("") == preferred_id
+        }) {
+            return selected["chain_id"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("Pipeline has no chain_id"));
+        }
+    }
 
     let active = routes
         .iter()
-        .find(|r| {
-            r["status"]
-                .as_str()
-                .unwrap_or("")
-                .eq_ignore_ascii_case("active")
-        })
+        .find(|route| is_active_route(route))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No active pipeline found. Cannot auto-detect chain.\n\
-                 Specify --chain <ID> explicitly, or create a pipeline at {}/pipelines", pipeline_init::frontend_url()
+                 Specify --chain <ID> explicitly, or create a pipeline at {}/pipelines",
+                pipeline_init::frontend_url()
             )
         })?;
 
     active["chain_id"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("Pipeline has no chain_id"))
+}
+
+async fn preferred_pipeline_id(api: &api::FactoApi, token: &str) -> Option<String> {
+    if let Ok(prefs) = api
+        .get::<serde_json::Value>("/v1/user/preferences", Some(token))
+        .await
+    {
+        if let Some(default_pipeline_id) = prefs["default_pipeline_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+        {
+            let mut cfg = config::load_config();
+            if cfg.default_pipeline_id.as_deref() != Some(default_pipeline_id) {
+                cfg.default_pipeline_id = Some(default_pipeline_id.to_string());
+                cfg.default_pipeline_cached_at = Some(chrono::Utc::now());
+                let _ = config::save_config(&cfg);
+            }
+            return Some(default_pipeline_id.to_string());
+        }
+    }
+
+    config::load_config().default_pipeline_id
+}
+
+/// Resolves chain_id: uses explicit value if provided, otherwise prefers the
+/// selected/default pipeline and falls back to the first active pipeline.
+async fn resolve_chain_id(explicit: Option<u64>, api: &api::FactoApi, token: &str) -> Result<u64> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+
+    let routes: Vec<serde_json::Value> = api
+        .get("/v1/routes/me", Some(token))
+        .await
+        .context("Failed to fetch routes for chain auto-detection")?;
+    let preferred_pipeline_id = preferred_pipeline_id(api, token).await;
+    resolve_chain_id_from_routes(explicit, &routes, preferred_pipeline_id.as_deref())
 }
 
 async fn cmd_balance(chain: Option<u64>, terse: bool) -> Result<()> {
@@ -661,7 +700,10 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
                 serde_json::to_string(&serde_json::json!({"pipelines": []}))?
             );
         } else {
-            println!("No active pipelines found. Create one at {}/pipelines", pipeline_init::frontend_url());
+            println!(
+                "No active pipelines found. Create one at {}/pipelines",
+                pipeline_init::frontend_url()
+            );
         }
         return Ok(());
     }
@@ -807,7 +849,14 @@ async fn cmd_pipeline_show(route_id: &str, terse: bool) -> Result<()> {
         println!("  Refund To:     {}", refund);
         println!("  Per-tx Limit:  ${}", per_tx);
         println!("  Daily Limit:   ${}", daily);
-        println!("  Status:        {}", if status == "active" { "✅ Active" } else { status });
+        println!(
+            "  Status:        {}",
+            if status == "active" {
+                "✅ Active"
+            } else {
+                status
+            }
+        );
     }
 
     Ok(())
@@ -1094,14 +1143,18 @@ async fn cmd_fund(
         .await
     {
         Ok(pc) => {
-            let redeemable = pc.get("redeemable").and_then(|v| v.as_bool()).unwrap_or(true);
-            let balance_raw = pc
-                .get("balance")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0");
+            let redeemable = pc
+                .get("redeemable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let balance_raw = pc.get("balance").and_then(|v| v.as_str()).unwrap_or("0");
             let balance_atomic: u128 = balance_raw.parse().unwrap_or(0);
             // Morpho returns 18-dec values regardless of asset_decimals
-            let effective_dec = if protocol_id == "morpho" { 18 } else { asset_dec };
+            let effective_dec = if protocol_id == "morpho" {
+                18
+            } else {
+                asset_dec
+            };
             let divisor = 10u128.pow(effective_dec as u32);
             let balance_human = format!("{:.2}", balance_atomic as f64 / divisor as f64);
 
@@ -1137,7 +1190,9 @@ async fn cmd_fund(
                         "❌ Insufficient balance in DeFi position.\n   Available: ${balance_human}  Requested: ${display_amount}\n   {reasons}"
                     );
                 }
-                bail!("Insufficient balance: available ${balance_human}, requested ${display_amount}");
+                bail!(
+                    "Insufficient balance: available ${balance_human}, requested ${display_amount}"
+                );
             }
 
             balance_human
@@ -1596,7 +1651,8 @@ fn format_services_terse(items: &[serde_json::Value]) -> String {
             }
             if raw == 0 {
                 obj["price_note"] = serde_json::Value::String(
-                    "Listed as free but may charge at call time. Use --max-amount to cap.".to_string()
+                    "Listed as free but may charge at call time. Use --max-amount to cap."
+                        .to_string(),
                 );
             }
             obj
@@ -1642,7 +1698,10 @@ fn format_services_human(items: &[serde_json::Value], total: i64, query: Option<
         };
         let version = item["x402Version"].as_i64().unwrap_or(2);
         let version_badge = if version >= 2 { "v2" } else { "v1" };
-        out.push_str(&format!("  {} [{}] [{}]\n", display_name, source, version_badge));
+        out.push_str(&format!(
+            "  {} [{}] [{}]\n",
+            display_name, source, version_badge
+        ));
         out.push_str(&format!("  URL:   {url}\n"));
         if raw > 0 {
             out.push_str(&format!("  Price: ${:.4} USDC\n", price_usd));
@@ -1659,6 +1718,153 @@ fn format_services_human(items: &[serde_json::Value], total: i64, query: Option<
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TestEnv {
+        home: PathBuf,
+        prev_home: Option<OsString>,
+        prev_api_url: Option<OsString>,
+    }
+
+    impl TestEnv {
+        fn new(api_url: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let home = std::env::temp_dir().join(format!(
+                "facto-cli-test-{}-{}",
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(home.join(".facto")).unwrap();
+
+            let prev_home = std::env::var_os("HOME");
+            let prev_api_url = std::env::var_os("FACTO_API_URL");
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FACTO_API_URL", api_url);
+
+            Self {
+                home,
+                prev_home,
+                prev_api_url,
+            }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_api_url {
+                Some(value) => std::env::set_var("FACTO_API_URL", value),
+                None => std::env::remove_var("FACTO_API_URL"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn start_balance_mock_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = 0;
+
+            while seen < 3 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap();
+                        let request = String::from_utf8_lossy(&buf[..n]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("")
+                            .to_string();
+                        requests.lock().unwrap().push(path.clone());
+
+                        let (status, body) = match path.as_str() {
+                            "/v1/routes/me" => (
+                                "200 OK",
+                                serde_json::json!([
+                                    {
+                                        "id": "first-active",
+                                        "status": "active",
+                                        "chain_id": 8453
+                                    },
+                                    {
+                                        "id": "selected-pipeline",
+                                        "status": "active",
+                                        "chain_id": 143
+                                    }
+                                ])
+                                .to_string(),
+                            ),
+                            "/v1/user/preferences" => (
+                                "200 OK",
+                                serde_json::json!({
+                                    "default_pipeline_id": "selected-pipeline"
+                                })
+                                .to_string(),
+                            ),
+                            "/v1/x402/balance?chain_id=143" => (
+                                "200 OK",
+                                serde_json::json!({
+                                    "wallet_address": "0x0000000000000000000000000000000000000123",
+                                    "usdc_balance": "1000000",
+                                    "usdc_balance_display": "$1.0000"
+                                })
+                                .to_string(),
+                            ),
+                            _ => (
+                                "404 Not Found",
+                                serde_json::json!({
+                                    "error": format!("unexpected path: {path}")
+                                })
+                                .to_string(),
+                            ),
+                        };
+
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        seen += 1;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("mock server accept failed: {err}"),
+                }
+            }
+
+            assert_eq!(seen, 3, "expected 3 requests, saw {seen}");
+        });
+
+        (format!("http://{}", addr), handle)
+    }
 
     fn make_item(name: &str, url: &str, source: &str, amount: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1788,6 +1994,92 @@ mod tests {
             "x402_response_body": "{\"success\":false,\"error\":\"boom\"}"
         });
         assert_eq!(charge_response_success_flag(&charge), Some(false));
+    }
+
+    #[test]
+    fn test_resolve_chain_id_from_routes_prefers_selected_pipeline() {
+        let routes = vec![
+            serde_json::json!({
+                "id": "first-active",
+                "status": "active",
+                "chain_id": 8453
+            }),
+            serde_json::json!({
+                "id": "selected-pipeline",
+                "status": "active",
+                "chain_id": 143
+            }),
+        ];
+
+        let chain_id =
+            resolve_chain_id_from_routes(None, &routes, Some("selected-pipeline")).unwrap();
+        assert_eq!(chain_id, 143);
+    }
+
+    #[test]
+    fn test_resolve_chain_id_from_routes_falls_back_to_first_active_pipeline() {
+        let routes = vec![
+            serde_json::json!({
+                "id": "inactive-selected",
+                "status": "inactive",
+                "chain_id": 8453
+            }),
+            serde_json::json!({
+                "id": "first-active",
+                "status": "active",
+                "chain_id": 42161
+            }),
+        ];
+
+        let chain_id =
+            resolve_chain_id_from_routes(None, &routes, Some("inactive-selected")).unwrap();
+        assert_eq!(chain_id, 42161);
+    }
+
+    #[test]
+    fn test_cmd_balance_uses_selected_pipeline_chain() {
+        let _guard = env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_url, server) = start_balance_mock_server(requests.clone());
+        let _env = TestEnv::new(&api_url);
+
+        config::save_credentials(&config::Credentials {
+            token: "test-token".to_string(),
+            user_id: "user-123".to_string(),
+            email: Some("dev@facto.to".to_string()),
+            expires_at: "2099-12-31T00:00:00Z".parse().unwrap(),
+            api_key: None,
+            signing_key: None,
+            auth_mode: Some("privy".to_string()),
+            deposit_addresses: None,
+        })
+        .unwrap();
+        config::save_config(&config::AppConfig {
+            env: "dev".to_string(),
+            api_urls: HashMap::new(),
+            default_pipeline_id: Some("stale-local-default".to_string()),
+            default_pipeline_cached_at: None,
+            last_update_check: None,
+        })
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            cmd_balance(None, true).await.unwrap();
+        });
+
+        server.join().unwrap();
+
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests[0], "/v1/routes/me");
+        assert_eq!(requests[1], "/v1/user/preferences");
+        assert_eq!(requests[2], "/v1/x402/balance?chain_id=143");
+
+        let cfg = config::load_config();
+        assert_eq!(
+            cfg.default_pipeline_id.as_deref(),
+            Some("selected-pipeline")
+        );
     }
 
     #[test]
@@ -1986,10 +2278,8 @@ fn chain_display_name(chain_id: u64) -> String {
 // Self-upgrade
 // ---------------------------------------------------------------------------
 
-const GITHUB_RELEASES_API: &str =
-    "https://api.github.com/repos/Facto-to/facto-cli/releases/latest";
-const GITHUB_DOWNLOAD_BASE: &str =
-    "https://github.com/Facto-to/facto-cli/releases/latest/download";
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/Facto-to/facto-cli/releases/latest";
+const GITHUB_DOWNLOAD_BASE: &str = "https://github.com/Facto-to/facto-cli/releases/latest/download";
 
 /// Check GitHub for the latest release version.
 /// Returns the version string (without leading "v") on success.
@@ -2072,11 +2362,7 @@ async fn do_upgrade(latest: &str) -> Result<()> {
         .build()?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
-        bail!(
-            "Download failed: HTTP {} from {}",
-            resp.status(),
-            url
-        );
+        bail!("Download failed: HTTP {} from {}", resp.status(), url);
     }
     let bytes = resp.bytes().await?;
     std::fs::write(&tmp, &bytes)
