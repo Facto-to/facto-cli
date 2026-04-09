@@ -96,6 +96,9 @@ pub struct AppConfig {
     /// When the pipeline cache was last refreshed.
     #[serde(default)]
     pub default_pipeline_cached_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the CLI last checked for updates (throttle: every 4 hours).
+    #[serde(default)]
+    pub last_update_check: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_env() -> String {
@@ -109,6 +112,7 @@ impl Default for AppConfig {
             api_urls: std::collections::HashMap::new(),
             default_pipeline_id: None,
             default_pipeline_cached_at: None,
+            last_update_check: None,
         }
     }
 }

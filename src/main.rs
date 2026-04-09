@@ -146,6 +146,13 @@ enum Commands {
         show: bool,
     },
 
+    /// Upgrade facto CLI to the latest version.
+    Upgrade {
+        /// Skip confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
+
     /// Clear local credentials.
     Logout,
 }
@@ -153,6 +160,19 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Startup update check: only in interactive (TTY) non-terse mode,
+    // skip for upgrade command itself, throttled to every 4 hours.
+    if !cli.terse && atty::is(atty::Stream::Stderr) && !matches!(cli.command, Commands::Upgrade { .. }) {
+        if let Some(latest) = check_update_throttled().await {
+            let current = env!("CARGO_PKG_VERSION");
+            if latest != current {
+                eprintln!(
+                    "\x1b[36m⬆ facto v{latest} available (current: v{current}). Run `facto upgrade` to update.\x1b[0m"
+                );
+            }
+        }
+    }
 
     match cli.command {
         Commands::Login {
@@ -273,6 +293,7 @@ async fn main() -> Result<()> {
             deposit_address,
             show,
         } => cmd_config(env, deposit_address, show, cli.terse),
+        Commands::Upgrade { yes } => cmd_upgrade(yes, cli.terse).await,
         Commands::Logout => cmd_logout(),
     }
 }
@@ -1959,4 +1980,183 @@ fn chain_display_name(chain_id: u64) -> String {
         46630 => "Robinhood Testnet".to_string(),
         other => format!("Chain {other}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Self-upgrade
+// ---------------------------------------------------------------------------
+
+const GITHUB_RELEASES_API: &str =
+    "https://api.github.com/repos/Facto-to/facto-cli/releases/latest";
+const GITHUB_DOWNLOAD_BASE: &str =
+    "https://github.com/Facto-to/facto-cli/releases/latest/download";
+
+/// Check GitHub for the latest release version.
+/// Returns the version string (without leading "v") on success.
+async fn check_latest_version() -> Option<String> {
+    #[derive(Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("facto-cli")
+        .build()
+        .ok()?;
+    let release: Release = client
+        .get(GITHUB_RELEASES_API)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(release.tag_name.trim_start_matches('v').to_string())
+}
+
+/// Throttled update check — at most once every 4 hours.
+/// Returns Some(latest_version) only if a newer version exists.
+async fn check_update_throttled() -> Option<String> {
+    let cfg = config::load_config();
+    if let Some(last) = cfg.last_update_check {
+        let elapsed = chrono::Utc::now() - last;
+        if elapsed < chrono::Duration::hours(4) {
+            return None; // Checked recently, skip
+        }
+    }
+
+    let latest = check_latest_version().await?;
+
+    // Record check time regardless of result
+    let mut cfg = config::load_config();
+    cfg.last_update_check = Some(chrono::Utc::now());
+    let _ = config::save_config(&cfg);
+
+    let current = env!("CARGO_PKG_VERSION");
+    if latest != current {
+        Some(latest)
+    } else {
+        None
+    }
+}
+
+/// Resolve the binary filename for the current OS and architecture.
+fn upgrade_binary_name() -> Result<String> {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => bail!("Unsupported OS: {other}"),
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        other => bail!("Unsupported architecture: {other}"),
+    };
+    Ok(format!("facto-{os}-{arch}"))
+}
+
+/// Download and install the latest binary, replacing the current one.
+async fn do_upgrade(latest: &str) -> Result<()> {
+    let binary_name = upgrade_binary_name()?;
+    let url = format!("{GITHUB_DOWNLOAD_BASE}/{binary_name}");
+    let install_dir = config::facto_dir()?.join("bin");
+    std::fs::create_dir_all(&install_dir)?;
+    let target = install_dir.join("facto");
+    let tmp = install_dir.join(".facto-upgrade-tmp");
+
+    eprintln!("Downloading facto v{latest} ({binary_name})...");
+
+    let client = reqwest::Client::builder()
+        .user_agent("facto-cli")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        bail!(
+            "Download failed: HTTP {} from {}",
+            resp.status(),
+            url
+        );
+    }
+    let bytes = resp.bytes().await?;
+    std::fs::write(&tmp, &bytes)
+        .with_context(|| format!("Failed to write to {}", tmp.display()))?;
+
+    // Make executable (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Atomic replace
+    std::fs::rename(&tmp, &target)
+        .with_context(|| format!("Failed to replace {}", target.display()))?;
+
+    eprintln!("✅ facto upgraded to v{latest}");
+    Ok(())
+}
+
+/// `facto upgrade` command handler.
+async fn cmd_upgrade(yes: bool, terse: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+
+    if terse {
+        // Machine-readable: just print version info as JSON
+        let latest = check_latest_version()
+            .await
+            .unwrap_or_else(|| current.to_string());
+        let up_to_date = latest == current;
+        println!(
+            "{}",
+            serde_json::json!({
+                "current": current,
+                "latest": latest,
+                "up_to_date": up_to_date,
+            })
+        );
+        if up_to_date {
+            return Ok(());
+        }
+        // In terse mode, don't actually upgrade — just report
+        return Ok(());
+    }
+
+    eprintln!("Checking for updates...");
+    let latest = match check_latest_version().await {
+        Some(v) => v,
+        None => {
+            eprintln!("Could not reach GitHub to check for updates.");
+            return Ok(());
+        }
+    };
+
+    if latest == current {
+        eprintln!("✅ Already up to date (v{current})");
+        return Ok(());
+    }
+
+    eprintln!("  Current: v{current}");
+    eprintln!("  Latest:  v{latest}");
+
+    if !yes {
+        eprint!("\nUpgrade to v{latest}? [Y/n] ");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if !input.is_empty() && input != "y" && input != "yes" {
+            eprintln!("Upgrade cancelled.");
+            return Ok(());
+        }
+    }
+
+    do_upgrade(&latest).await?;
+
+    // Update check timestamp
+    let mut cfg = config::load_config();
+    cfg.last_update_check = Some(chrono::Utc::now());
+    let _ = config::save_config(&cfg);
+
+    Ok(())
 }
