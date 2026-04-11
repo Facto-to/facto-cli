@@ -57,18 +57,33 @@ facto pipelines
 
 After that, choose the path that matches how you work.
 
+## Operator Setup Checklist
+
+- Install the latest `facto-cli` binary.
+- Authenticate the operator with `facto login`.
+- Link the Base payment pipeline with `facto pipeline create`.
+- Verify server wallet balance and active pipelines with `facto balance` and `facto pipelines`.
+
 ## Use With An Agent
 
 Give your agent the CLI plus the machine-facing setup docs:
 
 ```bash
-codex "Use facto-cli to call a paid BTC price API and return the JSON"
+codex "Use facto-cli plus https://monad-api.facto.to/SKILL.md to find a low-cost BTC price API, pay for it, and return only JSON."
 ```
 
 - Skill: `https://monad-api.facto.to/SKILL.md`
 - Catalog: `https://monad-api.facto.to/llms.txt`
 
 Your agent can decide whether it needs `facto services`, `facto pay`, `facto balance`, or `facto pipelines`.
+
+Prompt starters:
+
+```bash
+codex "Use facto-cli to find a Base token risk API, analyze 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, and summarize the paid result in five bullets."
+
+claude "使用 facto-cli 和 https://monad-api.facto.to/SKILL.md，查找 Base 钱包分析类 x402 API，分析 0x0a4CAA57ac414f6B936261ff7CB1d6883bBF7264，并返回重点结论。"
+```
 
 ## Use Manually
 
@@ -86,7 +101,7 @@ facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74
 |---------|-------------|
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
 | `facto pipeline create` | Open the browser to create a Base payment pipeline |
-| `facto whoami` | Show current account and pipeline count |
+| `facto whoami` | Diagnostic summary for the current operator account |
 | `facto balance` | Check server wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
 | `facto pipelines default [ID]` | Show or set the default pipeline used for auto-selected x402 chains |

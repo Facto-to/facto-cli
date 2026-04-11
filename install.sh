@@ -110,14 +110,15 @@ if [ "$ADDED_PATH" = true ]; then
 fi
 
 echo ""
-echo "Get started:"
+echo "Operator setup:"
 echo "  facto login             # Authenticate (opens browser)"
 echo "  facto pipeline create   # Create your Base payment pipeline"
 echo "  facto balance           # Check server wallet USDC"
 echo "  facto pipelines         # Inspect pipelines and balances"
 echo ""
-echo "With an agent:"
+echo "Agent handoff:"
 echo "  https://monad-api.facto.to/SKILL.md"
+echo "  codex \"Use facto-cli plus SKILL.md to find a low-cost BTC price API, pay for it, and return only JSON\""
 echo ""
 echo "Manual path:"
 echo "  facto services \"crypto\""

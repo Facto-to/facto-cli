@@ -8,9 +8,13 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::io::Write as _;
 
-/// Facto CLI — DeFi-funded Agent payments.
+/// Facto CLI — operator setup and DeFi-funded agent payments.
 #[derive(Debug, Parser)]
-#[command(name = "facto", version, about)]
+#[command(
+    name = "facto",
+    version,
+    about = "Facto CLI — operator setup and DeFi-funded agent payments"
+)]
 struct Cli {
     /// Output compact JSON (machine-readable).
     #[arg(short = 't', long = "terse", global = true)]
@@ -38,7 +42,7 @@ enum PipelineAction {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Authenticate via browser (Privy OAuth) or dev token.
+    /// Authenticate the operator via browser (Privy OAuth) or dev token.
     Login {
         /// Reserved for future CI/server support. Not supported for CLI user commands yet.
         #[arg(long)]
@@ -51,7 +55,7 @@ enum Commands {
         dev_token: Option<String>,
     },
 
-    /// Show the currently authenticated account.
+    /// Show a diagnostic summary of the current operator account.
     Whoami,
 
     /// Manage DeFi pipelines: list, view details, or set default.
@@ -83,10 +87,10 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Show past funding transactions.
+    /// Review past funding and x402 payment activity.
     History,
 
-    /// Call a paid API with automatic x402 payment.
+    /// Call a paid API directly with automatic x402 payment handling.
     Pay {
         /// HTTP method (GET, POST, PUT, DELETE).
         method: String,
@@ -112,14 +116,14 @@ enum Commands {
         yes: bool,
     },
 
-    /// Check server wallet USDC balance for x402 payments.
+    /// Inspect server wallet USDC available for x402 payments.
     Balance {
         /// Chain ID. If omitted, auto-detects from your active pipeline.
         #[arg(long)]
         chain: Option<u64>,
     },
 
-    /// Discover x402-enabled services. Optionally filter by keyword.
+    /// Discover x402-enabled services for manual use or agent planning.
     Services {
         /// Search keyword to filter services (e.g. "weather", "ai", "search").
         query: Option<String>,
@@ -149,7 +153,7 @@ enum Commands {
         show: bool,
     },
 
-    /// Upgrade facto CLI to the latest version.
+    /// Upgrade facto CLI to the latest published version.
     Upgrade {
         /// Skip confirmation prompt.
         #[arg(short, long)]
@@ -524,21 +528,26 @@ fn print_post_login_readiness_hint(readiness: &PostLoginReadiness) {
     println!();
     match readiness.status {
         "needs_pipeline" => {
-            println!("Next step: create your Base payment pipeline.");
+            println!("Operator setup incomplete.");
+            println!("Create the Base payment pipeline:");
             println!(
-                "Run: {}",
+                "  {}",
                 readiness.next_command.unwrap_or("facto pipeline create")
             );
             if let Some(url) = readiness.continue_url.as_deref() {
-                println!("Browser flow: {url}");
+                println!("  Browser: {url}");
             }
+            println!(
+                "Then inspect `facto balance` / `facto pipelines`, or hand control to your agent."
+            );
         }
         "configured" => {
-            println!("Base payment pipeline detected.");
+            println!("Operator setup ready.");
             if let Some(pipeline_id) = readiness.pipeline_id.as_deref() {
                 println!("Pipeline: {pipeline_id}");
             }
-            println!("Next: run `facto balance`, inspect `facto pipelines`, or hand control to your agent.");
+            println!("Operator checks: `facto balance` / `facto pipelines`");
+            println!("Agent handoff: https://monad-api.facto.to/SKILL.md");
         }
         _ => {}
     }

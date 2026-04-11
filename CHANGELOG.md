@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-04-12
+
+### Changed
+
+- Login guidance is now more explicitly agent-first: after setup, operators are told to inspect `facto balance` / `facto pipelines` or hand control to the hosted `SKILL.md`
+- README, install guidance, and developer-facing docs now include a short operator setup checklist and copy-ready agent prompt starters
+- Command help text now distinguishes operator diagnostics (`whoami`, `balance`, `pipelines`) from the lower-level manual request path (`services`, `pay`)
+
 ## [0.5.5] - 2026-04-11
 
 ### Changed
@@ -110,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
 [0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
+[0.5.6]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.6
 [0.5.5]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.5
 [0.5.3]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.3
 [0.3.1]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.1

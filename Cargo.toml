@@ -1,9 +1,9 @@
 [package]
 name = "facto-cli"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 rust-version = "1.75"
-description = "Facto CLI — DeFi-funded Agent payments via x402 protocol"
+description = "Facto CLI — operator setup and DeFi-funded agent payments via x402 protocol"
 license = "MIT"
 authors = ["Facto <dev@facto.to>"]
 repository = "https://github.com/Facto-to/facto-cli"
