@@ -215,9 +215,7 @@ pub async fn ensure_default_pipeline(
             let routes = fetch_my_routes(api, token).await.unwrap_or_default();
             base_routes = routes.into_iter().filter(is_valid_base_route).collect();
             if !base_routes.is_empty() {
-                eprintln!(
-                    "Base pipeline detected. If authorization is still pending, finish it in the browser before retrying your request."
-                );
+                eprintln!("Base pipeline detected.");
                 break;
             }
             if std::time::Instant::now() >= deadline {

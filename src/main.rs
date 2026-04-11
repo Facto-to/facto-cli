@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum PipelineAction {
-    /// Open the browser to create and authorize a Base payment pipeline.
+    /// Open the browser to create a Base payment pipeline.
     Create,
     /// Show details of a specific pipeline.
     Show {
@@ -322,23 +322,6 @@ struct LoginRouteStatus {
     id: String,
     chain_id: u64,
     status: String,
-    protocol_id: Option<String>,
-    eoa_address: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginAuthorizationStatus {
-    eoa_address: String,
-    spender_address: String,
-    chain_id: u64,
-    protocol_id: String,
-    is_authorized: Option<bool>,
-    allowance_amount: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct LoginMeResponse {
-    wallet_address: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -463,7 +446,6 @@ async fn cmd_login(
                         serde_json::to_string(&serde_json::json!({
                             "status": "authenticated",
                             "user_id": user_id,
-                            "base_pipeline_status": readiness.as_ref().map(|state| state.status),
                             "next_command": readiness.as_ref().and_then(|state| state.next_command),
                             "continue_url": readiness.as_ref().and_then(|state| state.continue_url.as_deref()),
                         }))?
@@ -511,14 +493,6 @@ fn pipeline_create_url() -> String {
     )
 }
 
-fn authorization_is_ready(auth: &LoginAuthorizationStatus) -> bool {
-    auth.is_authorized.unwrap_or(false)
-        || auth
-            .allowance_amount
-            .as_deref()
-            .is_some_and(|amount| !amount.is_empty() && amount != "0")
-}
-
 async fn detect_post_login_readiness(
     api: &api::FactoApi,
     token: &str,
@@ -538,57 +512,10 @@ async fn detect_post_login_readiness(
         });
     }
 
-    let me: LoginMeResponse = api
-        .get("/v1/auth/me", Some(token))
-        .await
-        .unwrap_or_default();
-    let server_wallet = me.wallet_address.unwrap_or_default().trim().to_lowercase();
-
-    let auths: Vec<LoginAuthorizationStatus> = api
-        .get("/v1/authorizations/me/8453", Some(token))
-        .await
-        .unwrap_or_default();
-
-    let has_ready_pipeline = base_routes.iter().any(|route| {
-        let Some(protocol_id) = route.protocol_id.as_deref() else {
-            return false;
-        };
-        let Some(eoa_address) = route.eoa_address.as_deref() else {
-            return false;
-        };
-        auths.iter().any(|auth| {
-            auth.chain_id == 8453
-                && auth.protocol_id.eq_ignore_ascii_case(protocol_id)
-                && auth.eoa_address.eq_ignore_ascii_case(eoa_address)
-                && (server_wallet.is_empty()
-                    || auth.spender_address.eq_ignore_ascii_case(&server_wallet))
-                && authorization_is_ready(auth)
-        })
-    });
-
-    if has_ready_pipeline {
-        return Ok(PostLoginReadiness {
-            status: "ready",
-            pipeline_id: base_routes.first().map(|route| route.id.clone()),
-            continue_url: None,
-            next_command: Some("facto services \"crypto\""),
-        });
-    }
-
-    let continue_url = if base_routes.len() == 1 {
-        Some(format!(
-            "{}/pipelines/{}",
-            pipeline_init::frontend_url(),
-            base_routes[0].id
-        ))
-    } else {
-        Some(format!("{}/pipelines", pipeline_init::frontend_url()))
-    };
-
     Ok(PostLoginReadiness {
-        status: "needs_authorization",
+        status: "configured",
         pipeline_id: base_routes.first().map(|route| route.id.clone()),
-        continue_url,
+        continue_url: None,
         next_command: None,
     })
 }
@@ -606,22 +533,12 @@ fn print_post_login_readiness_hint(readiness: &PostLoginReadiness) {
                 println!("Browser flow: {url}");
             }
         }
-        "needs_authorization" => {
-            println!("Base pipeline found, but wallet authorization is not complete yet.");
+        "configured" => {
+            println!("Base payment pipeline detected.");
             if let Some(pipeline_id) = readiness.pipeline_id.as_deref() {
                 println!("Pipeline: {pipeline_id}");
             }
-            if let Some(url) = readiness.continue_url.as_deref() {
-                println!("Continue setup in Facto: {url}");
-            }
-            println!("After approval, return here and run `facto services` or `facto pay`.");
-        }
-        "ready" => {
-            println!("Base payment pipeline is ready.");
-            println!(
-                "Next: {}",
-                readiness.next_command.unwrap_or("facto services")
-            );
+            println!("Next: run `facto balance`, inspect `facto pipelines`, or hand control to your agent.");
         }
         _ => {}
     }
@@ -718,7 +635,6 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
                 "email": email,
                 "pipelines": pipeline_count,
                 "authenticated": true,
-                "base_pipeline_status": readiness.as_ref().map(|state| state.status),
                 "next_command": readiness.as_ref().and_then(|state| state.next_command),
                 "continue_url": readiness.as_ref().and_then(|state| state.continue_url.as_deref()),
             }))?
@@ -729,11 +645,8 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
         println!("Pipelines:     {pipeline_count}");
         println!("Authenticated: ✅");
         if let Some(readiness) = readiness.as_ref() {
-            match readiness.status {
-                "needs_pipeline" => println!("Base pipeline: missing"),
-                "needs_authorization" => println!("Base pipeline: authorization pending"),
-                "ready" => println!("Base pipeline: ready"),
-                _ => {}
+            if readiness.status == "needs_pipeline" {
+                println!("Base pipeline: missing");
             }
         }
     }
@@ -2342,24 +2255,20 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_post_login_readiness_needs_authorization() {
+    fn test_detect_post_login_readiness_configured() {
         let _guard = env_lock().lock().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (api_url, server) = start_readiness_mock_server(
             requests.clone(),
-            3,
+            1,
             serde_json::json!([
                 {
                     "id": "route-1",
                     "chain_id": 8453,
-                    "status": "active",
-                    "protocol_id": "aave-v3",
-                    "eoa_address": "0xabc"
+                    "status": "active"
                 }
             ]),
-            serde_json::json!({
-                "wallet_address": "0xspender"
-            }),
+            serde_json::json!({}),
             serde_json::json!([]),
         );
         let _env = TestEnv::new(&api_url);
@@ -2371,38 +2280,31 @@ mod tests {
 
         server.join().unwrap();
 
-        assert_eq!(readiness.status, "needs_authorization");
+        assert_eq!(readiness.status, "configured");
         assert_eq!(readiness.pipeline_id.as_deref(), Some("route-1"));
     }
 
     #[test]
-    fn test_detect_post_login_readiness_ready() {
+    fn test_detect_post_login_readiness_configured_with_multiple_routes() {
         let _guard = env_lock().lock().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (api_url, server) = start_readiness_mock_server(
             requests.clone(),
-            3,
+            1,
             serde_json::json!([
                 {
                     "id": "route-1",
                     "chain_id": 8453,
-                    "status": "active",
-                    "protocol_id": "aave-v3",
-                    "eoa_address": "0xabc"
-                }
-            ]),
-            serde_json::json!({
-                "wallet_address": "0xspender"
-            }),
-            serde_json::json!([
+                    "status": "active"
+                },
                 {
-                    "eoa_address": "0xabc",
-                    "spender_address": "0xspender",
+                    "id": "route-2",
                     "chain_id": 8453,
-                    "protocol_id": "aave-v3",
-                    "is_authorized": true
+                    "status": "active"
                 }
             ]),
+            serde_json::json!({}),
+            serde_json::json!([]),
         );
         let _env = TestEnv::new(&api_url);
 
@@ -2413,9 +2315,9 @@ mod tests {
 
         server.join().unwrap();
 
-        assert_eq!(readiness.status, "ready");
+        assert_eq!(readiness.status, "configured");
         assert_eq!(readiness.pipeline_id.as_deref(), Some("route-1"));
-        assert_eq!(readiness.next_command, Some("facto services \"crypto\""));
+        assert_eq!(readiness.next_command, None);
     }
 
     #[test]

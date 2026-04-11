@@ -41,19 +41,42 @@ cargo install facto-cli
 
 The binary is named `facto`. The bundled installer writes to `~/.facto/bin/facto`. `cargo install` follows Cargo's bin directory, typically `~/.cargo/bin/facto`.
 
-## Quick Start
+## Shared Setup
 
 ```bash
 # 1. Authenticate (opens browser for Privy OAuth)
 facto login
 
-# 2. Create and authorize your Base payment pipeline
+# 2. Create your Base payment pipeline
 facto pipeline create
 
-# 3. Discover more x402 services
+# 3. Inspect operator state
+facto balance
+facto pipelines
+```
+
+After that, choose the path that matches how you work.
+
+## Use With An Agent
+
+Give your agent the CLI plus the machine-facing setup docs:
+
+```bash
+codex "Use facto-cli to call a paid BTC price API and return the JSON"
+```
+
+- Skill: `https://monad-api.facto.to/SKILL.md`
+- Catalog: `https://monad-api.facto.to/llms.txt`
+
+Your agent can decide whether it needs `facto services`, `facto pay`, `facto balance`, or `facto pipelines`.
+
+## Use Manually
+
+```bash
+# 1. Discover x402 services yourself
 facto services "weather"
 
-# 4. Call a paid API — payment is handled automatically
+# 2. Call a paid API — payment is handled automatically
 facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
 ```
 
@@ -62,13 +85,13 @@ facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74
 | Command | Description |
 |---------|-------------|
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
-| `facto pipeline create` | Open the browser to create and authorize a Base payment pipeline |
+| `facto pipeline create` | Open the browser to create a Base payment pipeline |
 | `facto whoami` | Show current account and pipeline count |
+| `facto balance` | Check server wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
 | `facto pipelines default [ID]` | Show or set the default pipeline used for auto-selected x402 chains |
 | `facto fund --amount N` | Withdraw N USDC from a DeFi position to your wallet |
 | `facto pay METHOD URL` | Call an API with automatic x402 payment handling |
-| `facto balance` | Check server wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto services [query]` | Discover x402-enabled services, optionally filtered by keyword |
 | `facto history` | Show past funding and payment transactions |
 | `facto config` | Configure deposit addresses for cross-chain transfers |
@@ -131,12 +154,12 @@ facto pipelines default <PIPELINE_ID>
 
 When `--chain` is omitted, `facto balance` and `facto pay` now prefer your selected default pipeline. If no default is set or it is no longer active, the CLI falls back to the first active pipeline.
 
-### Typical Agent Workflow
+### Typical Operator Workflow
 
 1. `facto login` — authenticate the CLI
-2. `facto pipeline create` — create and authorize the Base payment pipeline
-3. `facto -t services "<keyword>"` — find the right API
-4. `facto -t pay GET "<url>"` — call and parse the response
+2. `facto pipeline create` — connect the Base payment pipeline
+3. `facto balance` / `facto pipelines` — inspect payment capacity and pipeline selection
+4. Hand control to your agent, or use `facto services` and `facto pay` manually
 5. If balance is low: `facto fund --amount 5` — auto-selects pipeline
 6. `facto pipelines default <ID>` — pin the pipeline/chain used by `balance` and `pay`
 

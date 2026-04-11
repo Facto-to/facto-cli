@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-04-11
+
+### Changed
+
+- Login and `whoami` no longer expose a misleading Base pipeline authorization-pending state; first-run guidance now only distinguishes missing Base pipeline vs. Base pipeline detected
+- Terse login / whoami output now exposes only actionable onboarding hints (`next_command`, `continue_url`) instead of a brittle readiness state field
+- README, install guidance, and `SKILL.md` now treat `login -> pipeline create` as the shared setup, then split into agent-driven and manual CLI paths
+
 ## [0.5.4] - 2026-04-11
 
 ### Added
@@ -16,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - First-run CLI guidance now follows `login -> pipeline create -> services/pay` instead of implying authentication alone is enough for paid requests
-- Login and `whoami` now surface Base pipeline readiness hints: missing pipeline, authorization pending, or ready
+- Login and `whoami` now surface Base pipeline setup hints for first-run operators
 - Missing-pipeline flows now point to `/pipelines/create?source=cli&chain=base` instead of the generic pipeline list page
 
 ## [0.5.3] - 2026-04-09
@@ -102,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
 [0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
+[0.5.5]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.5
 [0.5.3]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.3
 [0.3.1]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.0

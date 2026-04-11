@@ -14,6 +14,10 @@ DeFi positions and pays x402 services automatically.
 3. Create the Base payment pipeline:
    facto pipeline create
 
+4. Check operator state if needed:
+   facto -t balance
+   facto -t pipelines
+
 ## Call Paid APIs
 
 facto pay -t GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
@@ -30,11 +34,12 @@ Search x402-enabled APIs by keyword. Returns JSON with URL, price, and descripti
 ## Workflow
 
 1. facto login → authenticate
-2. facto pipeline create → create and authorize the Base payment pipeline
-3. facto -t services "<keyword>" → find the right API
-4. facto -t pay GET "<url>" → call and parse response.body
-5. If insufficient balance error: facto fund --amount 5 → auto-selects pipeline
-6. Retry the pay command
+2. facto pipeline create → create the Base payment pipeline
+3. facto -t balance / facto -t pipelines → inspect capacity when needed
+4. If using manual discovery: facto -t services "<keyword>" → find the right API
+5. facto -t pay GET "<url>" → call and parse response.body
+6. If insufficient balance error: facto fund --amount 5 → auto-selects pipeline
+7. Retry the pay command
 
 ## Check Balance (if needed)
 
@@ -61,6 +66,7 @@ facto -t pipelines
 - Always use -t flag for machine-readable JSON output
 - facto pay auto-detects the chain from the x402 response — no --chain needed
 - `facto login` only authenticates; first-time users still need `facto pipeline create`
+- After setup, agents may go straight to `facto pay` if they already know the target URL
 - facto fund auto-selects the pipeline — no --chain or --pipeline needed for single pipeline
 - If fund fails with "insufficient balance", report the pipeline balance to the user
 - All amounts in human-readable USDC (e.g., "10", "0.50")
