@@ -11,8 +11,8 @@ DeFi positions and pays x402 services automatically.
 2. Login (opens browser):
    facto login
 
-3. Verify:
-   facto whoami
+3. Create the Base payment pipeline:
+   facto pipeline create
 
 ## Call Paid APIs
 
@@ -29,10 +29,12 @@ Search x402-enabled APIs by keyword. Returns JSON with URL, price, and descripti
 
 ## Workflow
 
-1. facto -t services "<keyword>" → find the right API
-2. facto -t pay GET "<url>" → call and parse response.body
-3. If insufficient balance error: facto fund --amount 5 → auto-selects pipeline
-4. Retry the pay command
+1. facto login → authenticate
+2. facto pipeline create → create and authorize the Base payment pipeline
+3. facto -t services "<keyword>" → find the right API
+4. facto -t pay GET "<url>" → call and parse response.body
+5. If insufficient balance error: facto fund --amount 5 → auto-selects pipeline
+6. Retry the pay command
 
 ## Check Balance (if needed)
 
@@ -44,6 +46,7 @@ facto -t pipelines
 | Command | Description |
 |---------|-------------|
 | facto login | Browser-based Privy authentication |
+| facto pipeline create | Open the browser to create a Base payment pipeline |
 | facto whoami | Show account info |
 | facto services -t [query] | Discover x402 services (JSON) |
 | facto pay -t METHOD URL | Call API with automatic x402 payment |
@@ -57,6 +60,7 @@ facto -t pipelines
 
 - Always use -t flag for machine-readable JSON output
 - facto pay auto-detects the chain from the x402 response — no --chain needed
+- `facto login` only authenticates; first-time users still need `facto pipeline create`
 - facto fund auto-selects the pipeline — no --chain or --pipeline needed for single pipeline
 - If fund fails with "insufficient balance", report the pipeline balance to the user
 - All amounts in human-readable USDC (e.g., "10", "0.50")

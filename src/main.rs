@@ -22,6 +22,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum PipelineAction {
+    /// Open the browser to create and authorize a Base payment pipeline.
+    Create,
     /// Show details of a specific pipeline.
     Show {
         /// Pipeline (route) ID.
@@ -53,6 +55,7 @@ enum Commands {
     Whoami,
 
     /// Manage DeFi pipelines: list, view details, or set default.
+    #[command(visible_alias = "pipeline")]
     Pipelines {
         #[command(subcommand)]
         action: Option<PipelineAction>,
@@ -186,6 +189,7 @@ async fn main() -> Result<()> {
         Commands::Whoami => cmd_whoami(cli.terse).await,
         Commands::Pipelines { action } => match action {
             None => cmd_pipelines(cli.terse).await,
+            Some(PipelineAction::Create) => cmd_pipeline_create(cli.terse),
             Some(PipelineAction::Show { id }) => cmd_pipeline_show(&id, cli.terse).await,
             Some(PipelineAction::Default { id }) => {
                 cmd_pipeline_default(id.as_deref(), cli.terse).await
@@ -313,6 +317,38 @@ struct SessionPollResponse {
     email: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LoginRouteStatus {
+    id: String,
+    chain_id: u64,
+    status: String,
+    protocol_id: Option<String>,
+    eoa_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginAuthorizationStatus {
+    eoa_address: String,
+    spender_address: String,
+    chain_id: u64,
+    protocol_id: String,
+    is_authorized: Option<bool>,
+    allowance_amount: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LoginMeResponse {
+    wallet_address: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PostLoginReadiness {
+    status: &'static str,
+    pipeline_id: Option<String>,
+    continue_url: Option<String>,
+    next_command: Option<&'static str>,
+}
+
 // ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
@@ -410,7 +446,7 @@ async fn cmd_login(
 
                 // Save credentials
                 config::save_credentials(&config::Credentials {
-                    token,
+                    token: token.clone(),
                     user_id: user_id.clone(),
                     email: email.clone(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
@@ -421,17 +457,24 @@ async fn cmd_login(
                 })?;
 
                 if terse {
+                    let readiness = detect_post_login_readiness(&facto, &token).await.ok();
                     println!(
                         "{}",
                         serde_json::to_string(&serde_json::json!({
                             "status": "authenticated",
                             "user_id": user_id,
+                            "base_pipeline_status": readiness.as_ref().map(|state| state.status),
+                            "next_command": readiness.as_ref().and_then(|state| state.next_command),
+                            "continue_url": readiness.as_ref().and_then(|state| state.continue_url.as_deref()),
                         }))?
                     );
                 } else {
                     println!("✅ Authenticated");
                     if let Some(e) = &email {
                         println!("Welcome, {e}");
+                    }
+                    if let Ok(readiness) = detect_post_login_readiness(&facto, &token).await {
+                        print_post_login_readiness_hint(&readiness);
                     }
                 }
                 return Ok(());
@@ -459,6 +502,129 @@ fn ensure_user_bearer_auth(creds: &config::Credentials) -> Result<()> {
         bail!("Missing bearer token. Run `facto login` again.");
     }
     Ok(())
+}
+
+fn pipeline_create_url() -> String {
+    format!(
+        "{}/pipelines/create?source=cli&chain=base",
+        pipeline_init::frontend_url()
+    )
+}
+
+fn authorization_is_ready(auth: &LoginAuthorizationStatus) -> bool {
+    auth.is_authorized.unwrap_or(false)
+        || auth
+            .allowance_amount
+            .as_deref()
+            .is_some_and(|amount| !amount.is_empty() && amount != "0")
+}
+
+async fn detect_post_login_readiness(
+    api: &api::FactoApi,
+    token: &str,
+) -> Result<PostLoginReadiness> {
+    let routes: Vec<LoginRouteStatus> = api.get("/v1/routes/me", Some(token)).await?;
+    let base_routes: Vec<LoginRouteStatus> = routes
+        .into_iter()
+        .filter(|route| route.chain_id == 8453 && route.status.eq_ignore_ascii_case("active"))
+        .collect();
+
+    if base_routes.is_empty() {
+        return Ok(PostLoginReadiness {
+            status: "needs_pipeline",
+            pipeline_id: None,
+            continue_url: Some(pipeline_create_url()),
+            next_command: Some("facto pipeline create"),
+        });
+    }
+
+    let me: LoginMeResponse = api
+        .get("/v1/auth/me", Some(token))
+        .await
+        .unwrap_or_default();
+    let server_wallet = me.wallet_address.unwrap_or_default().trim().to_lowercase();
+
+    let auths: Vec<LoginAuthorizationStatus> = api
+        .get("/v1/authorizations/me/8453", Some(token))
+        .await
+        .unwrap_or_default();
+
+    let has_ready_pipeline = base_routes.iter().any(|route| {
+        let Some(protocol_id) = route.protocol_id.as_deref() else {
+            return false;
+        };
+        let Some(eoa_address) = route.eoa_address.as_deref() else {
+            return false;
+        };
+        auths.iter().any(|auth| {
+            auth.chain_id == 8453
+                && auth.protocol_id.eq_ignore_ascii_case(protocol_id)
+                && auth.eoa_address.eq_ignore_ascii_case(eoa_address)
+                && (server_wallet.is_empty()
+                    || auth.spender_address.eq_ignore_ascii_case(&server_wallet))
+                && authorization_is_ready(auth)
+        })
+    });
+
+    if has_ready_pipeline {
+        return Ok(PostLoginReadiness {
+            status: "ready",
+            pipeline_id: base_routes.first().map(|route| route.id.clone()),
+            continue_url: None,
+            next_command: Some("facto services \"crypto\""),
+        });
+    }
+
+    let continue_url = if base_routes.len() == 1 {
+        Some(format!(
+            "{}/pipelines/{}",
+            pipeline_init::frontend_url(),
+            base_routes[0].id
+        ))
+    } else {
+        Some(format!("{}/pipelines", pipeline_init::frontend_url()))
+    };
+
+    Ok(PostLoginReadiness {
+        status: "needs_authorization",
+        pipeline_id: base_routes.first().map(|route| route.id.clone()),
+        continue_url,
+        next_command: None,
+    })
+}
+
+fn print_post_login_readiness_hint(readiness: &PostLoginReadiness) {
+    println!();
+    match readiness.status {
+        "needs_pipeline" => {
+            println!("Next step: create your Base payment pipeline.");
+            println!(
+                "Run: {}",
+                readiness.next_command.unwrap_or("facto pipeline create")
+            );
+            if let Some(url) = readiness.continue_url.as_deref() {
+                println!("Browser flow: {url}");
+            }
+        }
+        "needs_authorization" => {
+            println!("Base pipeline found, but wallet authorization is not complete yet.");
+            if let Some(pipeline_id) = readiness.pipeline_id.as_deref() {
+                println!("Pipeline: {pipeline_id}");
+            }
+            if let Some(url) = readiness.continue_url.as_deref() {
+                println!("Continue setup in Facto: {url}");
+            }
+            println!("After approval, return here and run `facto services` or `facto pay`.");
+        }
+        "ready" => {
+            println!("Base payment pipeline is ready.");
+            println!(
+                "Next: {}",
+                readiness.next_command.unwrap_or("facto services")
+            );
+        }
+        _ => {}
+    }
 }
 
 fn format_usdc_amount(raw: u64) -> String {
@@ -533,6 +699,7 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
         .context("Failed to fetch routes")?;
 
     let pipeline_count = routes.len();
+    let readiness = detect_post_login_readiness(&api, &creds.token).await.ok();
     let email = me["email"]
         .as_str()
         .filter(|email| !email.is_empty())
@@ -551,6 +718,9 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
                 "email": email,
                 "pipelines": pipeline_count,
                 "authenticated": true,
+                "base_pipeline_status": readiness.as_ref().map(|state| state.status),
+                "next_command": readiness.as_ref().and_then(|state| state.next_command),
+                "continue_url": readiness.as_ref().and_then(|state| state.continue_url.as_deref()),
             }))?
         );
     } else {
@@ -558,6 +728,14 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
         println!("User ID:       {user_id}");
         println!("Pipelines:     {pipeline_count}");
         println!("Authenticated: ✅");
+        if let Some(readiness) = readiness.as_ref() {
+            match readiness.status {
+                "needs_pipeline" => println!("Base pipeline: missing"),
+                "needs_authorization" => println!("Base pipeline: authorization pending"),
+                "ready" => println!("Base pipeline: ready"),
+                _ => {}
+            }
+        }
     }
 
     Ok(())
@@ -595,8 +773,8 @@ fn resolve_chain_id_from_routes(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No active pipeline found. Cannot auto-detect chain.\n\
-                 Specify --chain <ID> explicitly, or create a pipeline at {}/pipelines",
-                pipeline_init::frontend_url()
+                 Specify --chain <ID> explicitly, run `facto pipeline create`, or create one at {}",
+                pipeline_create_url()
             )
         })?;
 
@@ -701,8 +879,8 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
             );
         } else {
             println!(
-                "No active pipelines found. Create one at {}/pipelines",
-                pipeline_init::frontend_url()
+                "No active pipelines found. Run `facto pipeline create` or create one at {}",
+                pipeline_create_url()
             );
         }
         return Ok(());
@@ -814,6 +992,27 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_pipeline_create(terse: bool) -> Result<()> {
+    let url = pipeline_create_url();
+    if terse {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "status": "pipeline_create_required",
+                "chain_id": 8453,
+                "open_url": url,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("Opening browser to create your Base payment pipeline...");
+    println!("→ {url}");
+    println!("Complete the browser flow, then return to your terminal.");
+    let _ = open::that(&url);
     Ok(())
 }
 
@@ -965,8 +1164,9 @@ async fn cmd_fund(
                     .map(|id| chain_display_name(*id))
                     .collect();
                 bail!(
-                    "No active pipeline on a supported chain. Currently supported: {}.\nRun `facto pipelines` to see your pipelines or create one at {}/pipelines", pipeline_init::frontend_url(),
-                    supported.join(", ")
+                    "No active pipeline on a supported chain. Currently supported: {}.\nRun `facto pipeline create`, inspect `facto pipelines`, or create one at {}",
+                    supported.join(", "),
+                    pipeline_create_url()
                 );
             }
             1 => supported_routes[0],
@@ -1866,6 +2066,72 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    fn start_readiness_mock_server(
+        requests: Arc<Mutex<Vec<String>>>,
+        expected_requests: usize,
+        routes_body: serde_json::Value,
+        me_body: serde_json::Value,
+        auths_body: serde_json::Value,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = 0;
+
+            while seen < expected_requests && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap();
+                        let request = String::from_utf8_lossy(&buf[..n]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("")
+                            .to_string();
+                        requests.lock().unwrap().push(path.clone());
+
+                        let (status, body) = match path.as_str() {
+                            "/v1/routes/me" => ("200 OK", routes_body.to_string()),
+                            "/v1/auth/me" => ("200 OK", me_body.to_string()),
+                            "/v1/authorizations/me/8453" => ("200 OK", auths_body.to_string()),
+                            _ => (
+                                "404 Not Found",
+                                serde_json::json!({
+                                    "error": format!("unexpected path: {path}")
+                                })
+                                .to_string(),
+                            ),
+                        };
+
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        seen += 1;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("mock server accept failed: {err}"),
+                }
+            }
+
+            assert_eq!(
+                seen, expected_requests,
+                "expected {expected_requests} requests, saw {seen}"
+            );
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
     fn make_item(name: &str, url: &str, source: &str, amount: &str) -> serde_json::Value {
         serde_json::json!({
             "resource": url, "name": name,
@@ -2034,6 +2300,122 @@ mod tests {
         let chain_id =
             resolve_chain_id_from_routes(None, &routes, Some("inactive-selected")).unwrap();
         assert_eq!(chain_id, 42161);
+    }
+
+    #[test]
+    fn test_pipeline_create_alias_parses() {
+        let cli = Cli::parse_from(["facto", "pipeline", "create"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Pipelines {
+                action: Some(PipelineAction::Create)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_detect_post_login_readiness_needs_pipeline() {
+        let _guard = env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_url, server) = start_readiness_mock_server(
+            requests.clone(),
+            1,
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        );
+        let _env = TestEnv::new(&api_url);
+
+        let readiness = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { detect_post_login_readiness(&api::FactoApi::new(), "test").await })
+            .unwrap();
+
+        server.join().unwrap();
+
+        assert_eq!(readiness.status, "needs_pipeline");
+        assert_eq!(readiness.next_command, Some("facto pipeline create"));
+        assert_eq!(
+            requests.lock().unwrap().clone(),
+            vec!["/v1/routes/me".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_detect_post_login_readiness_needs_authorization() {
+        let _guard = env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_url, server) = start_readiness_mock_server(
+            requests.clone(),
+            3,
+            serde_json::json!([
+                {
+                    "id": "route-1",
+                    "chain_id": 8453,
+                    "status": "active",
+                    "protocol_id": "aave-v3",
+                    "eoa_address": "0xabc"
+                }
+            ]),
+            serde_json::json!({
+                "wallet_address": "0xspender"
+            }),
+            serde_json::json!([]),
+        );
+        let _env = TestEnv::new(&api_url);
+
+        let readiness = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { detect_post_login_readiness(&api::FactoApi::new(), "test").await })
+            .unwrap();
+
+        server.join().unwrap();
+
+        assert_eq!(readiness.status, "needs_authorization");
+        assert_eq!(readiness.pipeline_id.as_deref(), Some("route-1"));
+    }
+
+    #[test]
+    fn test_detect_post_login_readiness_ready() {
+        let _guard = env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_url, server) = start_readiness_mock_server(
+            requests.clone(),
+            3,
+            serde_json::json!([
+                {
+                    "id": "route-1",
+                    "chain_id": 8453,
+                    "status": "active",
+                    "protocol_id": "aave-v3",
+                    "eoa_address": "0xabc"
+                }
+            ]),
+            serde_json::json!({
+                "wallet_address": "0xspender"
+            }),
+            serde_json::json!([
+                {
+                    "eoa_address": "0xabc",
+                    "spender_address": "0xspender",
+                    "chain_id": 8453,
+                    "protocol_id": "aave-v3",
+                    "is_authorized": true
+                }
+            ]),
+        );
+        let _env = TestEnv::new(&api_url);
+
+        let readiness = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { detect_post_login_readiness(&api::FactoApi::new(), "test").await })
+            .unwrap();
+
+        server.join().unwrap();
+
+        assert_eq!(readiness.status, "ready");
+        assert_eq!(readiness.pipeline_id.as_deref(), Some("route-1"));
+        assert_eq!(readiness.next_command, Some("facto services \"crypto\""));
     }
 
     #[test]

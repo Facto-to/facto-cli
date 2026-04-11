@@ -47,11 +47,14 @@ The binary is named `facto`. The bundled installer writes to `~/.facto/bin/facto
 # 1. Authenticate (opens browser for Privy OAuth)
 facto login
 
-# 2. Call a paid API — payment is handled automatically
-facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
+# 2. Create and authorize your Base payment pipeline
+facto pipeline create
 
 # 3. Discover more x402 services
 facto services "weather"
+
+# 4. Call a paid API — payment is handled automatically
+facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
 ```
 
 ## Commands
@@ -59,6 +62,7 @@ facto services "weather"
 | Command | Description |
 |---------|-------------|
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
+| `facto pipeline create` | Open the browser to create and authorize a Base payment pipeline |
 | `facto whoami` | Show current account and pipeline count |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
 | `facto pipelines default [ID]` | Show or set the default pipeline used for auto-selected x402 chains |
@@ -93,6 +97,9 @@ Facto CLI supports these authentication modes today:
 # Browser-based (default) — opens Privy OAuth flow
 facto login
 
+# First-time operator path — create the Base payment pipeline in the browser
+facto pipeline create
+
 # Dev token — for local testing only
 facto login --dev-token "dev:<user_id>"
 ```
@@ -126,11 +133,12 @@ When `--chain` is omitted, `facto balance` and `facto pay` now prefer your selec
 
 ### Typical Agent Workflow
 
-1. `facto -t services "<keyword>"` — find the right API
-2. `facto -t pay GET "<url>"` — call and parse the response
-3. If balance is low: `facto fund --amount 5` — auto-selects pipeline
-4. `facto pipelines default <ID>` — pin the pipeline/chain used by `balance` and `pay`
-5. `facto -t pipelines` — inspect DeFi pipeline balance if needed
+1. `facto login` — authenticate the CLI
+2. `facto pipeline create` — create and authorize the Base payment pipeline
+3. `facto -t services "<keyword>"` — find the right API
+4. `facto -t pay GET "<url>"` — call and parse the response
+5. If balance is low: `facto fund --amount 5` — auto-selects pipeline
+6. `facto pipelines default <ID>` — pin the pipeline/chain used by `balance` and `pay`
 
 ## Configuration
 

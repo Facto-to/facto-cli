@@ -448,7 +448,7 @@ async fn select_funding_pipeline(
 
     if active.is_empty() {
         bail!(
-            "No active pipelines found. Create one at {}/pipelines",
+            "No active pipelines found. Run `facto pipeline create` or create one at {}/pipelines/create?source=cli&chain=base",
             crate::pipeline_init::frontend_url()
         );
     }

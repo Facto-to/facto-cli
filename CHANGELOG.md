@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.4] - 2026-04-11
+
+### Added
+
+- `facto pipeline create` as a visible alias-backed entry point that opens the Base pipeline creation flow in the browser
+
+### Changed
+
+- First-run CLI guidance now follows `login -> pipeline create -> services/pay` instead of implying authentication alone is enough for paid requests
+- Login and `whoami` now surface Base pipeline readiness hints: missing pipeline, authorization pending, or ready
+- Missing-pipeline flows now point to `/pipelines/create?source=cli&chain=base` instead of the generic pipeline list page
+
 ## [0.5.3] - 2026-04-09
 
 ### Fixed
@@ -87,6 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
+[0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
 [0.5.3]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.3
 [0.3.1]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.3.0

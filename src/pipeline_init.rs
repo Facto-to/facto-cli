@@ -111,6 +111,10 @@ pub fn frontend_url() -> &'static str {
     }
 }
 
+fn pipeline_create_url() -> String {
+    format!("{}/pipelines/create?source=cli&chain=base", frontend_url())
+}
+
 // ── Interactive prompt helper ─────────────────────────────────────────────
 
 fn prompt_choice(label: &str, max: usize) -> Result<usize> {
@@ -191,10 +195,12 @@ pub async fn ensure_default_pipeline(
 
     // ── Step 3a: no Base routes ──────────────────────────────────────────
     if base_routes.is_empty() {
-        let create_url = format!("{}/pipelines?source=cli&chain=base", frontend_url());
+        let create_url = pipeline_create_url();
 
         if terse {
-            bail!("No active Base pipeline found. Create one at: {create_url}");
+            bail!(
+                "No active Base pipeline found. Run `facto pipeline create` or create one at: {create_url}"
+            );
         }
 
         // Interactive: open browser and poll.
@@ -209,7 +215,9 @@ pub async fn ensure_default_pipeline(
             let routes = fetch_my_routes(api, token).await.unwrap_or_default();
             base_routes = routes.into_iter().filter(is_valid_base_route).collect();
             if !base_routes.is_empty() {
-                eprintln!("Base pipeline detected.");
+                eprintln!(
+                    "Base pipeline detected. If authorization is still pending, finish it in the browser before retrying your request."
+                );
                 break;
             }
             if std::time::Instant::now() >= deadline {
