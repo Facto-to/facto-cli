@@ -366,6 +366,7 @@ async fn fund_from_pipeline(
     match try_fund(api, token, &pipeline_id, amount_human).await {
         Ok(()) => Ok(()),
         Err(e) => {
+            let cli_meta = crate::pipeline_init::resolve_cli_meta(Some(api)).await;
             let msg = e.to_string();
             eprintln!();
             eprintln!("  ❌ Funding failed: {msg}");
@@ -374,7 +375,7 @@ async fn fund_from_pipeline(
             eprintln!("    [1] Try a different pipeline");
             eprintln!(
                 "    [2] Complete authorization at {}/pipelines",
-                crate::pipeline_init::frontend_url()
+                cli_meta.frontend_url
             );
             eprintln!("    [3] Exit");
             eprintln!();
@@ -394,9 +395,9 @@ async fn fund_from_pipeline(
                         return try_fund(api, token, &alt_id, amount_human).await;
                     }
                     "2" => {
-                        let url = format!(
-                            "{}/pipelines/{pipeline_id}",
-                            crate::pipeline_init::frontend_url()
+                        let url = crate::pipeline_init::pipeline_detail_url(
+                            &cli_meta.frontend_url,
+                            &pipeline_id,
                         );
                         eprintln!("  Opening: {url}");
                         let _ = open::that(&url);
@@ -447,9 +448,10 @@ async fn select_funding_pipeline(
         .collect();
 
     if active.is_empty() {
+        let cli_meta = crate::pipeline_init::resolve_cli_meta(Some(api)).await;
         bail!(
-            "No active pipelines found. Run `facto pipeline create` or create one at {}/pipelines/create?source=cli&chain=base",
-            crate::pipeline_init::frontend_url()
+            "No active pipelines found. Run `facto pipeline create` or create one at {}",
+            cli_meta.pipeline_create_url
         );
     }
 

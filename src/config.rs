@@ -99,6 +99,12 @@ pub struct AppConfig {
     /// When the CLI last checked for updates (throttle: every 4 hours).
     #[serde(default)]
     pub last_update_check: Option<chrono::DateTime<chrono::Utc>>,
+    /// Cached frontend URL served by the backend for browser handoff.
+    #[serde(default)]
+    pub frontend_url: Option<String>,
+    /// When the frontend URL cache was last refreshed.
+    #[serde(default)]
+    pub frontend_url_cached_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_env() -> String {
@@ -113,6 +119,8 @@ impl Default for AppConfig {
             default_pipeline_id: None,
             default_pipeline_cached_at: None,
             last_update_check: None,
+            frontend_url: None,
+            frontend_url_cached_at: None,
         }
     }
 }

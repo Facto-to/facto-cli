@@ -25,6 +25,8 @@ Your DeFi Position (Aave V3 / Morpho)
 2. Facto CLI withdraws from your position on demand
 3. When calling a paid API, the CLI detects the `402 Payment Required` response, signs a USDC payment, and retries — all in one command
 
+Browser setup surfaces are deployment-aware: `facto login`, `facto pipeline create`, and other browser handoff links are sourced from the active Facto backend, so a frontend domain change does not require a separate CLI URL patch.
+
 ## Install
 
 **Pre-built binary** (macOS / Linux):
@@ -145,6 +147,8 @@ facto login --dev-token "dev:<user_id>"
 `--api-key` / `--signing-key` are reserved for future server and CI support, but CLI user commands currently require browser login or `--dev-token`.
 
 Credentials are stored in `~/.facto/credentials.json`.
+
+The active Facto backend now provides the login and pipeline-create browser URLs. The CLI only keeps a legacy fallback for older backend deployments.
 
 ## Agent Integration
 

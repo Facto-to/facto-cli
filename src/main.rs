@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
         Commands::Whoami => cmd_whoami(cli.terse).await,
         Commands::Pipelines { action } => match action {
             None => cmd_pipelines(cli.terse).await,
-            Some(PipelineAction::Create) => cmd_pipeline_create(cli.terse),
+            Some(PipelineAction::Create) => cmd_pipeline_create(cli.terse).await,
             Some(PipelineAction::Show { id }) => cmd_pipeline_show(&id, cli.terse).await,
             Some(PipelineAction::Default { id }) => {
                 cmd_pipeline_default(id.as_deref(), cli.terse).await
@@ -311,6 +311,10 @@ async fn main() -> Result<()> {
 struct SessionCreateResponse {
     session_id: String,
     auth_url: String,
+    #[serde(default)]
+    frontend_url: Option<String>,
+    #[serde(default)]
+    pipeline_create_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +338,19 @@ struct PostLoginReadiness {
     pipeline_id: Option<String>,
     continue_url: Option<String>,
     next_command: Option<&'static str>,
+}
+
+fn session_cli_meta(session: &SessionCreateResponse) -> Option<pipeline_init::CliMeta> {
+    session.frontend_url.as_deref().map(|frontend_url| {
+        let normalized = frontend_url.trim_end_matches('/').to_string();
+        pipeline_init::CliMeta {
+            pipeline_create_url: session
+                .pipeline_create_url
+                .clone()
+                .unwrap_or_else(|| pipeline_init::pipeline_create_url_from_frontend(&normalized)),
+            frontend_url: normalized,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +421,10 @@ async fn cmd_login(
     let session: SessionCreateResponse = facto
         .post("/v1/cli/session", &serde_json::json!({}))
         .await?;
+
+    if let Some(meta) = session_cli_meta(&session) {
+        let _ = pipeline_init::cache_cli_meta(&meta);
+    }
 
     // 2. Open the browser
     if !terse {
@@ -490,17 +511,15 @@ fn ensure_user_bearer_auth(creds: &config::Credentials) -> Result<()> {
     Ok(())
 }
 
-fn pipeline_create_url() -> String {
-    format!(
-        "{}/pipelines/create?source=cli&chain=base",
-        pipeline_init::frontend_url()
-    )
+fn cached_pipeline_create_url() -> String {
+    pipeline_init::cached_or_legacy_cli_meta().pipeline_create_url
 }
 
 async fn detect_post_login_readiness(
     api: &api::FactoApi,
     token: &str,
 ) -> Result<PostLoginReadiness> {
+    let cli_meta = pipeline_init::resolve_cli_meta(Some(api)).await;
     let routes: Vec<LoginRouteStatus> = api.get("/v1/routes/me", Some(token)).await?;
     let base_routes: Vec<LoginRouteStatus> = routes
         .into_iter()
@@ -511,7 +530,7 @@ async fn detect_post_login_readiness(
         return Ok(PostLoginReadiness {
             status: "needs_pipeline",
             pipeline_id: None,
-            continue_url: Some(pipeline_create_url()),
+            continue_url: Some(cli_meta.pipeline_create_url),
             next_command: Some("facto pipeline create"),
         });
     }
@@ -696,7 +715,7 @@ fn resolve_chain_id_from_routes(
             anyhow::anyhow!(
                 "No active pipeline found. Cannot auto-detect chain.\n\
                  Specify --chain <ID> explicitly, run `facto pipeline create`, or create one at {}",
-                pipeline_create_url()
+                cached_pipeline_create_url()
             )
         })?;
 
@@ -802,7 +821,9 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
         } else {
             println!(
                 "No active pipelines found. Run `facto pipeline create` or create one at {}",
-                pipeline_create_url()
+                pipeline_init::resolve_cli_meta(Some(&api))
+                    .await
+                    .pipeline_create_url
             );
         }
         return Ok(());
@@ -917,8 +938,11 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pipeline_create(terse: bool) -> Result<()> {
-    let url = pipeline_create_url();
+async fn cmd_pipeline_create(terse: bool) -> Result<()> {
+    let api = api::FactoApi::new();
+    let url = pipeline_init::resolve_cli_meta(Some(&api))
+        .await
+        .pipeline_create_url;
     if terse {
         println!(
             "{}",
@@ -1088,7 +1112,9 @@ async fn cmd_fund(
                 bail!(
                     "No active pipeline on a supported chain. Currently supported: {}.\nRun `facto pipeline create`, inspect `facto pipelines`, or create one at {}",
                     supported.join(", "),
-                    pipeline_create_url()
+                    pipeline_init::resolve_cli_meta(Some(&api))
+                        .await
+                        .pipeline_create_url
                 );
             }
             1 => supported_routes[0],
@@ -1373,7 +1399,8 @@ async fn cmd_fund(
         _ => "https://etherscan.io",
     };
     let explorer_url = format!("{explorer_base}/tx/{tx_hash}");
-    let facto_url = format!("{}/charges/{charge_id}", pipeline_init::frontend_url());
+    let cli_meta = pipeline_init::resolve_cli_meta(Some(&api)).await;
+    let facto_url = pipeline_init::charge_url(&cli_meta.frontend_url, charge_id);
 
     // Confirm balance arrived on-chain (poll up to ~30s)
     let confirmed_balance = if resolved_recipient == user_wallet {
@@ -1991,6 +2018,7 @@ mod tests {
     fn start_readiness_mock_server(
         requests: Arc<Mutex<Vec<String>>>,
         expected_requests: usize,
+        cli_meta_body: serde_json::Value,
         routes_body: serde_json::Value,
         me_body: serde_json::Value,
         auths_body: serde_json::Value,
@@ -2018,6 +2046,7 @@ mod tests {
                         requests.lock().unwrap().push(path.clone());
 
                         let (status, body) = match path.as_str() {
+                            "/v1/cli/meta" => ("200 OK", cli_meta_body.to_string()),
                             "/v1/routes/me" => ("200 OK", routes_body.to_string()),
                             "/v1/auth/me" => ("200 OK", me_body.to_string()),
                             "/v1/authorizations/me/8453" => ("200 OK", auths_body.to_string()),
@@ -2236,12 +2265,52 @@ mod tests {
     }
 
     #[test]
+    fn test_session_cli_meta_uses_backend_pipeline_create_url() {
+        let session = SessionCreateResponse {
+            session_id: "sess_123".to_string(),
+            auth_url: "https://user.example/cli-auth?session=sess_123".to_string(),
+            frontend_url: Some("https://user.example/".to_string()),
+            pipeline_create_url: Some(
+                "https://user.example/custom/pipelines/create?source=cli&chain=base".to_string(),
+            ),
+        };
+
+        let meta = session_cli_meta(&session).unwrap();
+        assert_eq!(meta.frontend_url, "https://user.example");
+        assert_eq!(
+            meta.pipeline_create_url,
+            "https://user.example/custom/pipelines/create?source=cli&chain=base"
+        );
+    }
+
+    #[test]
+    fn test_session_cli_meta_derives_pipeline_create_url_when_backend_omits_it() {
+        let session = SessionCreateResponse {
+            session_id: "sess_123".to_string(),
+            auth_url: "https://user.example/cli-auth?session=sess_123".to_string(),
+            frontend_url: Some("https://user.example/".to_string()),
+            pipeline_create_url: None,
+        };
+
+        let meta = session_cli_meta(&session).unwrap();
+        assert_eq!(meta.frontend_url, "https://user.example");
+        assert_eq!(
+            meta.pipeline_create_url,
+            "https://user.example/pipelines/create?source=cli&chain=base"
+        );
+    }
+
+    #[test]
     fn test_detect_post_login_readiness_needs_pipeline() {
         let _guard = env_lock().lock().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (api_url, server) = start_readiness_mock_server(
             requests.clone(),
-            1,
+            2,
+            serde_json::json!({
+                "frontend_url": "https://user.example",
+                "pipeline_create_url": "https://user.example/pipelines/create?source=cli&chain=base"
+            }),
             serde_json::json!([]),
             serde_json::json!({}),
             serde_json::json!([]),
@@ -2258,8 +2327,12 @@ mod tests {
         assert_eq!(readiness.status, "needs_pipeline");
         assert_eq!(readiness.next_command, Some("facto pipeline create"));
         assert_eq!(
+            readiness.continue_url.as_deref(),
+            Some("https://user.example/pipelines/create?source=cli&chain=base")
+        );
+        assert_eq!(
             requests.lock().unwrap().clone(),
-            vec!["/v1/routes/me".to_string()]
+            vec!["/v1/cli/meta".to_string(), "/v1/routes/me".to_string()]
         );
     }
 
@@ -2269,7 +2342,11 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (api_url, server) = start_readiness_mock_server(
             requests.clone(),
-            1,
+            2,
+            serde_json::json!({
+                "frontend_url": "https://user.example",
+                "pipeline_create_url": "https://user.example/pipelines/create?source=cli&chain=base"
+            }),
             serde_json::json!([
                 {
                     "id": "route-1",
@@ -2299,7 +2376,11 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (api_url, server) = start_readiness_mock_server(
             requests.clone(),
-            1,
+            2,
+            serde_json::json!({
+                "frontend_url": "https://user.example",
+                "pipeline_create_url": "https://user.example/pipelines/create?source=cli&chain=base"
+            }),
             serde_json::json!([
                 {
                     "id": "route-1",
@@ -2353,6 +2434,8 @@ mod tests {
             default_pipeline_id: Some("stale-local-default".to_string()),
             default_pipeline_cached_at: None,
             last_update_check: None,
+            frontend_url: None,
+            frontend_url_cached_at: None,
         })
         .unwrap();
 

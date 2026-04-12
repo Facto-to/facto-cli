@@ -39,13 +39,25 @@ struct SetDefaultPipeline {
 #[derive(Debug, Deserialize)]
 struct AckResponse {}
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CliMeta {
+    pub frontend_url: String,
+    pub pipeline_create_url: String,
+}
+
 // ── Cache TTL ─────────────────────────────────────────────────────────────
 
 const CACHE_TTL_SECS: i64 = 3600; // 1 hour
+const FRONTEND_CACHE_TTL_SECS: i64 = 3600; // 1 hour
 
 fn cache_is_fresh(cached_at: &chrono::DateTime<chrono::Utc>) -> bool {
     let age = chrono::Utc::now().signed_duration_since(*cached_at);
     age.num_seconds() < CACHE_TTL_SECS
+}
+
+fn frontend_cache_is_fresh(cached_at: &chrono::DateTime<chrono::Utc>) -> bool {
+    let age = chrono::Utc::now().signed_duration_since(*cached_at);
+    age.num_seconds() < FRONTEND_CACHE_TTL_SECS
 }
 
 // ── Backend helpers ───────────────────────────────────────────────────────
@@ -103,7 +115,7 @@ async fn set_default(api: &FactoApi, token: &str, pipeline_id: &str) -> Result<(
 
 // ── Frontend URL helper ───────────────────────────────────────────────────
 
-pub fn frontend_url() -> &'static str {
+fn legacy_frontend_url() -> &'static str {
     let cfg = config::load_config();
     match cfg.env.as_str() {
         "prod" => "https://facto.xyz",
@@ -111,8 +123,103 @@ pub fn frontend_url() -> &'static str {
     }
 }
 
-fn pipeline_create_url() -> String {
-    format!("{}/pipelines/create?source=cli&chain=base", frontend_url())
+fn normalize_frontend_url(frontend_url: &str) -> String {
+    frontend_url.trim_end_matches('/').to_string()
+}
+
+pub fn pipeline_create_url_from_frontend(frontend_url: &str) -> String {
+    format!(
+        "{}/pipelines/create?source=cli&chain=base",
+        normalize_frontend_url(frontend_url)
+    )
+}
+
+pub fn pipeline_detail_url(frontend_url: &str, pipeline_id: &str) -> String {
+    format!(
+        "{}/pipelines/{}",
+        normalize_frontend_url(frontend_url),
+        pipeline_id
+    )
+}
+
+pub fn charge_url(frontend_url: &str, charge_id: &str) -> String {
+    format!(
+        "{}/charges/{charge_id}",
+        normalize_frontend_url(frontend_url)
+    )
+}
+
+fn legacy_cli_meta() -> CliMeta {
+    let frontend_url = legacy_frontend_url().to_string();
+    CliMeta {
+        pipeline_create_url: pipeline_create_url_from_frontend(&frontend_url),
+        frontend_url,
+    }
+}
+
+pub fn cached_or_legacy_cli_meta() -> CliMeta {
+    let cfg = config::load_config();
+    if let (Some(frontend_url), Some(cached_at)) = (
+        cfg.frontend_url.as_ref(),
+        cfg.frontend_url_cached_at.as_ref(),
+    ) {
+        if frontend_cache_is_fresh(cached_at) {
+            let normalized = normalize_frontend_url(frontend_url);
+            return CliMeta {
+                pipeline_create_url: pipeline_create_url_from_frontend(&normalized),
+                frontend_url: normalized,
+            };
+        }
+    }
+    legacy_cli_meta()
+}
+
+pub fn cache_cli_meta(meta: &CliMeta) -> Result<()> {
+    let mut cfg = config::load_config();
+    cfg.frontend_url = Some(normalize_frontend_url(&meta.frontend_url));
+    cfg.frontend_url_cached_at = Some(chrono::Utc::now());
+    config::save_config(&cfg).context("Failed to save frontend URL cache to config")
+}
+
+async fn fetch_cli_meta(api: &FactoApi) -> Result<CliMeta> {
+    let meta: CliMeta = api
+        .get("/v1/cli/meta", None)
+        .await
+        .context("Failed to fetch CLI browser surfaces")?;
+    let frontend_url = normalize_frontend_url(&meta.frontend_url);
+    Ok(CliMeta {
+        pipeline_create_url: if meta.pipeline_create_url.trim().is_empty() {
+            pipeline_create_url_from_frontend(&frontend_url)
+        } else {
+            meta.pipeline_create_url
+        },
+        frontend_url,
+    })
+}
+
+pub async fn resolve_cli_meta(api: Option<&FactoApi>) -> CliMeta {
+    let cfg = config::load_config();
+    if let (Some(frontend_url), Some(cached_at)) = (
+        cfg.frontend_url.as_ref(),
+        cfg.frontend_url_cached_at.as_ref(),
+    ) {
+        if frontend_cache_is_fresh(cached_at) {
+            let normalized = normalize_frontend_url(frontend_url);
+            return CliMeta {
+                pipeline_create_url: pipeline_create_url_from_frontend(&normalized),
+                frontend_url: normalized,
+            };
+        }
+    }
+
+    if let Some(api) = api {
+        if let Ok(meta) = fetch_cli_meta(api).await {
+            let _ = cache_cli_meta(&meta);
+            return meta;
+        }
+    }
+
+    legacy_cli_meta()
 }
 
 // ── Interactive prompt helper ─────────────────────────────────────────────
@@ -195,7 +302,7 @@ pub async fn ensure_default_pipeline(
 
     // ── Step 3a: no Base routes ──────────────────────────────────────────
     if base_routes.is_empty() {
-        let create_url = pipeline_create_url();
+        let create_url = resolve_cli_meta(Some(api)).await.pipeline_create_url;
 
         if terse {
             bail!(

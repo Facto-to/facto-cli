@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-04-12
+
+### Changed
+
+- Browser handoff URLs now come from the active Facto backend deployment instead of being hardcoded inside the CLI, so `facto login` and `facto pipeline create` stay aligned when the user app domain changes
+- CLI now caches the backend-provided frontend URL for follow-up browser flows such as funding recovery and charge detail links, while keeping a legacy fallback for older backend deployments
+- README and `SKILL.md` now document that browser setup surfaces are deployment-aware and sourced from the backend
+
 ## [0.5.6] - 2026-04-12
 
 ### Changed
@@ -117,6 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HMAC-SHA256 authentication for API key mode
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
+[0.5.7]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.7
 [0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
 [0.5.6]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.6
 [0.5.5]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.5
