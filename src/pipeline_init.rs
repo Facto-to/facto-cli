@@ -115,12 +115,10 @@ async fn set_default(api: &FactoApi, token: &str, pipeline_id: &str) -> Result<(
 
 // ── Frontend URL helper ───────────────────────────────────────────────────
 
+const LEGACY_FRONTEND_URL: &str = "https://facto-pay-agentic.vercel.app";
+
 fn legacy_frontend_url() -> &'static str {
-    let cfg = config::load_config();
-    match cfg.env.as_str() {
-        "prod" => "https://facto.xyz",
-        _ => "https://facto-pay-monad-advanced.vercel.app",
-    }
+    LEGACY_FRONTEND_URL
 }
 
 fn normalize_frontend_url(frontend_url: &str) -> String {
@@ -220,6 +218,21 @@ pub async fn resolve_cli_meta(api: Option<&FactoApi>) -> CliMeta {
     }
 
     legacy_cli_meta()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_cli_meta_points_to_agentic_frontend() {
+        let meta = legacy_cli_meta();
+        assert_eq!(meta.frontend_url, LEGACY_FRONTEND_URL);
+        assert_eq!(
+            meta.pipeline_create_url,
+            "https://facto-pay-agentic.vercel.app/pipelines/create?source=cli&chain=base"
+        );
+    }
 }
 
 // ── Interactive prompt helper ─────────────────────────────────────────────

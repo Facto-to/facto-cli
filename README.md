@@ -25,7 +25,7 @@ Your DeFi Position (Aave V3 / Morpho)
 2. Facto CLI withdraws from your position on demand
 3. When calling a paid API, the CLI detects the `402 Payment Required` response, signs a USDC payment, and retries — all in one command
 
-Browser setup surfaces are deployment-aware: `facto login`, `facto pipeline create`, and other browser handoff links are sourced from the active Facto backend, so a frontend domain change does not require a separate CLI URL patch.
+Browser setup surfaces are deployment-aware: `facto login`, `facto pipeline create`, and other browser handoff links are sourced from the active Facto backend, so a frontend domain change does not require a separate CLI URL patch. If backend CLI metadata is temporarily unavailable, the CLI falls back to the agentic user frontend at `https://facto-pay-agentic.vercel.app`.
 
 ## Install
 

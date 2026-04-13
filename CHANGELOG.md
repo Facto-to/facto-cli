@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-04-13
+
+### Changed
+
+- Legacy browser-handoff fallback now also points at `https://facto-pay-agentic.vercel.app`, so both `prod` and `dev` CLI environments fall back to the same agentic user frontend when backend CLI metadata is unavailable
+- The fallback frontend no longer branches on local CLI environment; the backend remains the primary source of truth, and the local default is now a single deployment-safe agentic surface
+
 ## [0.5.7] - 2026-04-12
 
 ### Changed
@@ -126,6 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
 [0.5.7]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.7
+[0.5.8]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.8
 [0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
 [0.5.6]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.6
 [0.5.5]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.5

@@ -18,7 +18,7 @@ DeFi positions and pays x402 services automatically.
    facto -t balance
    facto -t pipelines
 
-Browser handoff URLs come from the active Facto backend deployment, so `facto login` and `facto pipeline create` stay aligned if the user app domain changes.
+Browser handoff URLs come from the active Facto backend deployment, so `facto login` and `facto pipeline create` stay aligned if the user app domain changes. If backend CLI metadata is unavailable, the CLI falls back to `https://facto-pay-agentic.vercel.app`.
 
 ## Operator Handoff
 
