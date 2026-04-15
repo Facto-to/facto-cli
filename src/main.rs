@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod interactive;
+mod pay;
 mod pipeline_init;
 
 use anyhow::{bail, Context as _, Result};
@@ -26,8 +27,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum PipelineAction {
-    /// Open the browser to create a Base payment pipeline.
-    Create,
+    /// Open the browser to create a payment pipeline.
+    Create {
+        /// Optional target chain for the creation flow.
+        #[arg(long, value_parser = ["base", "monad"])]
+        chain: Option<String>,
+        /// Preload the create flow for a specific target payment URL.
+        #[arg(long)]
+        for_pay: Option<String>,
+    },
     /// Show details of a specific pipeline.
     Show {
         /// Pipeline (route) ID.
@@ -96,6 +104,9 @@ enum Commands {
         method: String,
         /// Target API URL.
         url: String,
+        /// Payment protocol override (auto, x402, mpp).
+        #[arg(long, default_value = "auto", value_parser = ["auto", "x402", "mpp"])]
+        protocol: String,
         /// Custom HTTP headers (-H "Key: Value"), can be repeated.
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
@@ -193,7 +204,9 @@ async fn main() -> Result<()> {
         Commands::Whoami => cmd_whoami(cli.terse).await,
         Commands::Pipelines { action } => match action {
             None => cmd_pipelines(cli.terse).await,
-            Some(PipelineAction::Create) => cmd_pipeline_create(cli.terse).await,
+            Some(PipelineAction::Create { chain, for_pay }) => {
+                cmd_pipeline_create(cli.terse, chain.as_deref(), for_pay.as_deref()).await
+            }
             Some(PipelineAction::Show { id }) => cmd_pipeline_show(&id, cli.terse).await,
             Some(PipelineAction::Default { id }) => {
                 cmd_pipeline_default(id.as_deref(), cli.terse).await
@@ -218,6 +231,7 @@ async fn main() -> Result<()> {
         Commands::Pay {
             method,
             url,
+            protocol,
             headers,
             data,
             max_amount,
@@ -225,48 +239,17 @@ async fn main() -> Result<()> {
             chain,
             yes,
         } => {
-            if !yes && !cli.terse && !dry_run {
-                let (api, creds) = api::FactoApi::authenticated()?;
-                ensure_user_bearer_auth(&creds)?;
-
-                let init = pipeline_init::ensure_default_pipeline(&api, &creds.token, cli.terse)
-                    .await
-                    .ok();
-                let default_id = init.as_ref().map(|i| i.pipeline_id.as_str());
-
-                // Parse max_amount string to atomic u64 (6-dec USDC).
-                let max_amount_atomic: u64 = max_amount
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(|f| (f * 1_000_000.0) as u64)
-                    .unwrap_or(0);
-
-                let confirm_chain = chain.unwrap_or(8453);
-                let proceed = interactive::confirm_before_pay(
-                    &api,
-                    &creds.token,
-                    &url,
-                    max_amount_atomic,
-                    default_id,
-                    cli.terse,
-                    confirm_chain,
-                )
-                .await?;
-
-                if !proceed {
-                    return Ok(());
-                }
-            }
-
             cmd_pay(
                 &method,
                 &url,
+                &protocol,
                 &headers,
                 data.as_deref(),
                 max_amount.as_deref(),
                 dry_run,
                 chain,
                 cli.terse,
+                yes,
             )
             .await
         }
@@ -521,12 +504,12 @@ async fn detect_post_login_readiness(
 ) -> Result<PostLoginReadiness> {
     let cli_meta = pipeline_init::resolve_cli_meta(Some(api)).await;
     let routes: Vec<LoginRouteStatus> = api.get("/v1/routes/me", Some(token)).await?;
-    let base_routes: Vec<LoginRouteStatus> = routes
+    let active_routes: Vec<LoginRouteStatus> = routes
         .into_iter()
-        .filter(|route| route.chain_id == 8453 && route.status.eq_ignore_ascii_case("active"))
+        .filter(|route| route.status.eq_ignore_ascii_case("active"))
         .collect();
 
-    if base_routes.is_empty() {
+    if active_routes.is_empty() {
         return Ok(PostLoginReadiness {
             status: "needs_pipeline",
             pipeline_id: None,
@@ -537,7 +520,7 @@ async fn detect_post_login_readiness(
 
     Ok(PostLoginReadiness {
         status: "configured",
-        pipeline_id: base_routes.first().map(|route| route.id.clone()),
+        pipeline_id: active_routes.first().map(|route| route.id.clone()),
         continue_url: None,
         next_command: None,
     })
@@ -548,7 +531,7 @@ fn print_post_login_readiness_hint(readiness: &PostLoginReadiness) {
     match readiness.status {
         "needs_pipeline" => {
             println!("Operator setup incomplete.");
-            println!("Create the Base payment pipeline:");
+            println!("Create a payment pipeline:");
             println!(
                 "  {}",
                 readiness.next_command.unwrap_or("facto pipeline create")
@@ -938,24 +921,32 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_pipeline_create(terse: bool) -> Result<()> {
+async fn cmd_pipeline_create(
+    terse: bool,
+    chain: Option<&str>,
+    for_pay: Option<&str>,
+) -> Result<()> {
     let api = api::FactoApi::new();
-    let url = pipeline_init::resolve_cli_meta(Some(&api))
-        .await
-        .pipeline_create_url;
+    let meta = pipeline_init::resolve_cli_meta(Some(&api)).await;
+    let url = if let Some(target_url) = for_pay {
+        pipeline_init::pipeline_create_url_for_pay(&meta.frontend_url, target_url, chain)
+    } else {
+        pipeline_init::pipeline_create_url_from_frontend_and_chain(&meta.frontend_url, chain)
+    };
     if terse {
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
                 "status": "pipeline_create_required",
-                "chain_id": 8453,
                 "open_url": url,
+                "chain_hint": chain,
+                "for_pay": for_pay,
             }))?
         );
         return Ok(());
     }
 
-    println!("Opening browser to create your Base payment pipeline...");
+    println!("Opening browser to create a compatible payment pipeline...");
     println!("→ {url}");
     println!("Complete the browser flow, then return to your terminal.");
     let _ = open::that(&url);
@@ -1143,6 +1134,18 @@ async fn cmd_fund(
     let protocol_id = route["protocol_id"].as_str().unwrap_or("compound-v2");
     let yield_token = route["yield_token"].as_str().unwrap_or("");
     let eoa_address = route["eoa_address"].as_str().unwrap_or("");
+
+    if !is_fund_supported(chain_id) {
+        bail!(
+            "Funding via CLI is not supported on {} yet. Supported chains: {}.",
+            chain_display_name(chain_id),
+            SUPPORTED_FUND_CHAINS
+                .iter()
+                .map(|id| chain_display_name(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Format display amount
     let display_amount = format!("{:.2}", parsed);
@@ -1369,6 +1372,7 @@ async fn cmd_fund(
         .subsec_nanos();
     let invoice_id = format!("CLI-FUND-{}-{:06X}", timestamp, rand_suffix & 0xFFFFFF);
 
+    let spend_mode = fund_spend_mode(route);
     let body = serde_json::json!({
         "user_address":        user_wallet,
         "protocol_id":         protocol_id,
@@ -1377,7 +1381,7 @@ async fn cmd_fund(
         "recipient_address":   resolved_recipient,
         "source_eoa_address":  eoa_address,
         "chain_id":            chain_id,
-        "spend_mode":          "withdraw",
+        "spend_mode":          spend_mode,
         "invoice_id":          invoice_id,
     });
 
@@ -1391,10 +1395,9 @@ async fn cmd_fund(
     let status = resp["status"].as_str().unwrap_or("—");
 
     let explorer_base = match chain_id {
-        4217 | 42431 => "https://explore.tempo.xyz",
         42161 => "https://arbiscan.io",
         421614 => "https://sepolia.arbiscan.io",
-        143 => "https://monadscan.com",
+        143 => "https://monad.socialscan.io",
         8453 => "https://basescan.org",
         _ => "https://etherscan.io",
     };
@@ -1642,30 +1645,54 @@ async fn cmd_history(terse: bool) -> Result<()> {
 async fn cmd_pay(
     method: &str,
     url: &str,
+    protocol: &str,
     headers: &[String],
     data: Option<&str>,
     max_amount: Option<&str>,
     dry_run: bool,
     chain: Option<u64>,
     terse: bool,
+    yes: bool,
 ) -> Result<()> {
     let (api, creds) = api::FactoApi::authenticated()?;
     ensure_user_bearer_auth(&creds)?;
-    let chain = resolve_chain_id(chain, &api, &creds.token).await?;
 
-    // Parse custom headers
-    let mut header_map = std::collections::HashMap::new();
-    for h in headers {
-        if let Some((k, v)) = h.split_once(':') {
-            header_map.insert(k.trim().to_string(), v.trim().to_string());
-        }
+    let protocol_mode = pay::ProtocolMode::parse(Some(protocol))?;
+    let selected_pipeline_id = preferred_pipeline_id(&api, &creds.token).await;
+    let parsed_data = parse_request_body(data)?;
+    let header_map = parse_request_headers(headers);
+    let max_amount_atomic = parse_usdc_amount(max_amount);
+
+    let resolve_request = pay::PayResolveRequest {
+        url: url.to_string(),
+        method: method.to_uppercase(),
+        headers: header_map.clone(),
+        body: parsed_data.clone(),
+        protocol: match protocol_mode {
+            pay::ProtocolMode::Auto => None,
+            _ => Some(protocol_mode.as_str().to_string()),
+        },
+        max_amount: max_amount.map(|value| value.to_string()),
+        chain_id: chain,
+    };
+
+    let resolve = pay::resolve_payment(&api, &creds.token, &resolve_request).await?;
+
+    let execution_pipeline_id = if resolve.requires_payment {
+        resolve_execution_pipeline(
+            &resolve,
+            selected_pipeline_id.as_deref(),
+            !dry_run && !terse,
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let mut resolved_chain_id = chain.or(resolve.chain_id);
+    if resolved_chain_id.is_none() && resolve.requires_payment {
+        resolved_chain_id = Some(resolve_chain_id(None, &api, &creds.token).await?);
     }
-
-    // Convert human-readable max_amount to atomic units (6 decimals USDC)
-    let max_amount_atomic = max_amount.map(|s| {
-        let parsed: f64 = s.parse().unwrap_or(0.0);
-        format!("{}", (parsed * 1_000_000.0) as u64)
-    });
 
     if dry_run {
         if terse {
@@ -1673,96 +1700,412 @@ async fn cmd_pay(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "dry_run": true,
-                    "method": method,
-                    "url": url,
-                    "chain_id": chain,
-                    "max_amount": max_amount.unwrap_or("(pipeline limit)"),
+                    "protocol": resolve.protocol,
+                    "requires_payment": resolve.requires_payment,
+                    "payment_method": resolve.payment_method,
+                    "chain_id": resolved_chain_id,
+                    "quoted_amount": resolve.quoted_amount,
+                    "compatible_pipeline_ids": resolve.compatible_pipeline_ids,
+                    "recommended_execution_pipeline_id": resolve.recommended_execution_pipeline_id,
+                    "selected_pipeline_id": selected_pipeline_id,
+                    "execution_pipeline_id": execution_pipeline_id,
+                    "create_pipeline_url": resolve.create_pipeline_url,
                 }))?
             );
         } else {
-            println!("Dry run — would call:");
-            println!("  {} {}", method, url);
-            println!("  Chain: {} ({})", chain_display_name(chain), chain);
-            if let Some(ma) = max_amount {
-                println!("  Max payment: ${ma} USDC");
+            println!("Dry run — resolved payment target:");
+            println!("  URL:      {url}");
+            println!("  Method:   {}", method.to_uppercase());
+            println!("  Protocol: {}", resolve.protocol);
+            if let Some(method_label) = resolve.payment_method.as_deref() {
+                println!("  Method ID: {method_label}");
+            }
+            if let Some(chain_id) = resolved_chain_id {
+                println!("  Chain:    {} ({chain_id})", chain_display_name(chain_id));
+            }
+            if let Some(amount) = resolve.quoted_amount.as_deref().or(max_amount) {
+                println!("  Max pay:  {amount}");
+            }
+            if let Some(execution_pipeline_id) = execution_pipeline_id.as_deref() {
+                println!("  Exec pipe: {execution_pipeline_id}");
+            }
+            if let Some(url) = resolve.create_pipeline_url.as_deref() {
+                println!("  Create:   {url}");
             }
         }
         return Ok(());
     }
 
-    if !terse {
-        println!("Calling {} {}...", method, url);
+    if !resolve.requires_payment {
+        let resp = execute_free_request(url, method, &header_map, parsed_data.as_ref()).await?;
+        print_payment_result(
+            &resp,
+            terse,
+            selected_pipeline_id.as_deref(),
+            None,
+            Some(resolve.protocol.as_str()),
+        )?;
+        return Ok(());
     }
 
-    // Parse --data as JSON object if possible, otherwise send as string.
-    // This avoids double-encoding: {"body": "{\"key\":\"val\"}"} → {"body": {"key":"val"}}
-    let parsed_data: Option<serde_json::Value> =
-        data.map(|s| serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.to_string())));
+    let execution_pipeline_id = match execution_pipeline_id {
+        Some(id) => id,
+        None => {
+            let reason_hint = pay::explain_resolve_reason(resolve.reason.as_deref());
+            if let Some(url) = resolve.create_pipeline_url.as_deref() {
+                if terse {
+                    if let Some(reason_hint) = reason_hint {
+                        bail!("{reason_hint} Create one at {url} or run `facto pipelines create`.");
+                    }
+                    bail!(
+                        "No compatible pipeline available. Create one at {url} or run `facto pipelines create`."
+                    );
+                }
+                println!(
+                    "{}",
+                    reason_hint.unwrap_or("No compatible pipeline is currently available.")
+                );
+                println!("Create one now: {url}");
+                bail!("No compatible pipeline available");
+            }
+            bail!("No compatible pipeline available");
+        }
+    };
 
-    let body = serde_json::json!({
+    let quoted_amount = resolve
+        .quoted_amount
+        .as_deref()
+        .or(max_amount)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let chain_id = resolved_chain_id.unwrap_or(8453);
+    let supports_prefund = resolve.protocol == "x402"
+        || (resolve.protocol == "mpp" && resolve.can_auto_fund.unwrap_or(false));
+    let confirmed = if supports_prefund {
+        interactive::confirm_before_pay(
+            &api,
+            &creds.token,
+            url,
+            quoted_amount,
+            Some(execution_pipeline_id.as_str()),
+            terse,
+            chain_id,
+            &resolve.protocol,
+            yes || terse,
+            !yes && !terse,
+        )
+        .await?
+    } else if yes || terse {
+        true
+    } else {
+        interactive::confirm_payment_only(
+            url,
+            quoted_amount,
+            Some(execution_pipeline_id.as_str()),
+            &resolve.protocol,
+        )?
+    };
+    if !confirmed {
+        return Ok(());
+    }
+
+    if let Some(notice) =
+        pay::temporary_pipeline_notice(selected_pipeline_id.as_deref(), &execution_pipeline_id)
+    {
+        if !terse {
+            println!("{notice}");
+        }
+    }
+
+    let chain_id = resolved_chain_id.unwrap_or(8453);
+    let max_amount_atomic = max_amount_atomic.or_else(|| resolve.quoted_amount.clone());
+    let protocol_name = resolve.protocol.clone();
+    let body = build_payment_request_body(
+        url,
+        method,
+        header_map,
+        parsed_data,
+        chain_id,
+        max_amount_atomic.clone(),
+        protocol_name.clone(),
+        resolve.payment_method.clone(),
+        selected_pipeline_id.clone(),
+        Some(execution_pipeline_id.clone()),
+    );
+
+    let endpoint = pay::payment_endpoint(protocol_name.as_str()).unwrap_or("/v1/x402/pay");
+    let resp: serde_json::Value = api
+        .post_authenticated(endpoint, &body, &creds.token)
+        .await
+        .with_context(|| format!("{} request failed", endpoint.trim_start_matches('/')))
+        .context("payment request failed")?;
+
+    print_payment_result(
+        &resp,
+        terse,
+        selected_pipeline_id.as_deref(),
+        Some(execution_pipeline_id.as_str()),
+        Some(protocol_name.as_str()),
+    )?;
+
+    Ok(())
+}
+
+fn build_payment_request_body(
+    url: &str,
+    method: &str,
+    header_map: std::collections::HashMap<String, String>,
+    parsed_data: Option<serde_json::Value>,
+    chain_id: u64,
+    max_amount_atomic: Option<String>,
+    protocol_name: String,
+    payment_method: Option<String>,
+    selected_pipeline_id: Option<String>,
+    execution_pipeline_id: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
         "url": url,
         "method": method.to_uppercase(),
         "headers": header_map,
         "body": parsed_data,
-        "chain_id": chain,
-        "max_amount": max_amount_atomic,
-    });
+        "chainId": chain_id,
+        "maxAmount": max_amount_atomic,
+        "protocol": protocol_name,
+        "paymentMethod": payment_method,
+        "selectedPipelineId": selected_pipeline_id,
+        "executionPipelineId": execution_pipeline_id,
+    })
+}
 
-    let resp: serde_json::Value = api
-        .post_authenticated("/v1/x402/pay", &body, &creds.token)
+fn parse_request_headers(headers: &[String]) -> std::collections::HashMap<String, String> {
+    let mut header_map = std::collections::HashMap::new();
+    for header in headers {
+        if let Some((key, value)) = header.split_once(':') {
+            header_map.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    header_map
+}
+
+fn parse_request_body(data: Option<&str>) -> Result<Option<serde_json::Value>> {
+    Ok(data.map(|value| {
+        serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.to_string()))
+    }))
+}
+
+fn parse_usdc_amount(raw: Option<&str>) -> Option<String> {
+    raw.and_then(|value| value.parse::<f64>().ok())
+        .map(|value| format!("{}", (value * 1_000_000.0) as u64))
+}
+
+fn resolve_execution_pipeline(
+    resolve: &pay::PayResolveResponse,
+    selected_pipeline_id: Option<&str>,
+    allow_prompt: bool,
+) -> Result<String> {
+    match pay::choose_execution_pipeline(
+        selected_pipeline_id,
+        &resolve.compatible_pipeline_ids,
+        resolve.recommended_execution_pipeline_id.as_deref(),
+    ) {
+        Ok(decision) => Ok(decision.execution_pipeline_id),
+        Err(_err) if allow_prompt && !resolve.compatible_pipeline_ids.is_empty() => {
+            prompt_execution_pipeline_choice(
+                &resolve.compatible_pipeline_ids,
+                resolve.recommended_execution_pipeline_id.as_deref(),
+            )
+        }
+        Err(err) if resolve.compatible_pipeline_ids.is_empty() => {
+            let reason_hint = pay::explain_resolve_reason(resolve.reason.as_deref());
+            if let Some(url) = resolve.create_pipeline_url.as_deref() {
+                if !allow_prompt {
+                    if let Some(reason_hint) = reason_hint {
+                        bail!("{reason_hint} Create one at {url}. ({err})");
+                    }
+                    bail!("No compatible pipeline available. Create one at {url}. ({err})");
+                }
+                println!(
+                    "{}",
+                    reason_hint.unwrap_or("No compatible pipeline is currently available.")
+                );
+                println!("Create one now: {url}");
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn prompt_execution_pipeline_choice(
+    compatible_pipeline_ids: &[String],
+    recommended_execution_pipeline_id: Option<&str>,
+) -> Result<String> {
+    eprintln!();
+    eprintln!("Multiple compatible pipelines found:");
+    for (idx, pipeline_id) in compatible_pipeline_ids.iter().enumerate() {
+        let recommended = recommended_execution_pipeline_id
+            .filter(|recommended| *recommended == pipeline_id)
+            .map(|_| " (recommended)")
+            .unwrap_or("");
+        eprintln!("  {}. {}{}", idx + 1, pipeline_id, recommended);
+    }
+
+    loop {
+        eprint!(
+            "Select execution pipeline (1-{}): ",
+            compatible_pipeline_ids.len()
+        );
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        let bytes = std::io::stdin().read_line(&mut line).unwrap_or(0);
+        if bytes == 0 {
+            bail!("No execution pipeline selected.");
+        }
+        if let Ok(choice) = line.trim().parse::<usize>() {
+            if (1..=compatible_pipeline_ids.len()).contains(&choice) {
+                return Ok(compatible_pipeline_ids[choice - 1].clone());
+            }
+        }
+        eprintln!(
+            "Please enter a number between 1 and {}.",
+            compatible_pipeline_ids.len()
+        );
+    }
+}
+
+async fn execute_free_request(
+    url: &str,
+    method: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .context("invalid HTTP method for free request")?;
+    let mut req = client.request(method, url);
+    for (key, value) in headers {
+        req = req.header(key, value);
+    }
+    if let Some(value) = body {
+        if value.is_object() || value.is_array() {
+            req = req.json(value);
+        } else if let Some(text) = value.as_str() {
+            req = req.body(text.to_string());
+        } else {
+            req = req.json(value);
+        }
+    }
+
+    let resp = req
+        .send()
         .await
-        .context("x402 pay request failed")?;
+        .with_context(|| format!("GET {url} failed"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
 
+    Ok(serde_json::json!({
+        "status": "free",
+        "response": {
+            "status_code": status.as_u16(),
+            "body": body,
+        }
+    }))
+}
+
+fn print_payment_result(
+    resp: &serde_json::Value,
+    terse: bool,
+    selected_pipeline_id: Option<&str>,
+    execution_pipeline_id: Option<&str>,
+    protocol: Option<&str>,
+) -> Result<()> {
     let status = resp["status"].as_str().unwrap_or("unknown");
-
     if status == "error" || status == "failed" {
         let error = resp["error"].as_str().unwrap_or("Unknown error");
         if terse {
-            println!("{}", serde_json::to_string(&resp)?);
+            println!("{}", serde_json::to_string(resp)?);
         } else {
             println!("❌ {error}");
         }
         bail!("{error}");
     }
 
-    if status != "paid" && status != "free" {
-        bail!("Unexpected x402 pay status: {status}");
-    }
-
     if terse {
-        println!("{}", serde_json::to_string(&resp)?);
-    } else {
-        if status == "paid" {
-            let amount = resp["payment"]["amount_display"].as_str().unwrap_or("?");
-            let pay_to = resp["payment"]["pay_to"].as_str().unwrap_or("?");
-            let charge_id = resp["payment"]["charge_id"].as_str().unwrap_or("?");
-            let resp_status = resp["response"]["status_code"].as_u64().unwrap_or(0);
-
-            let pay_to_short = if pay_to.len() > 10 {
-                format!("{}...{}", &pay_to[..6], &pay_to[pay_to.len() - 4..])
-            } else {
-                pay_to.to_string()
-            };
-
-            println!("💳 Payment required: {amount} USDC → {pay_to_short}");
-            println!("✅ Paid & received response ({resp_status})");
-            println!();
-            println!("Payment:");
-            println!("  Amount:    {amount} USDC");
-            println!("  To:        {pay_to_short}");
-            println!("  Charge:    {charge_id}");
-            println!();
-            println!("Response:");
-        } else {
-            let resp_status = resp["response"]["status_code"].as_u64().unwrap_or(0);
-            println!("✅ Response ({resp_status}) — no payment required");
-            println!();
-            println!("Response:");
-        }
-        let body = resp["response"]["body"].as_str().unwrap_or("");
-        println!("{body}");
+        let mut object = resp.as_object().cloned().unwrap_or_default();
+        object.insert(
+            "selected_pipeline_id".to_string(),
+            selected_pipeline_id
+                .map(|value| serde_json::Value::String(value.to_string()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "execution_pipeline_id".to_string(),
+            execution_pipeline_id
+                .map(|value| serde_json::Value::String(value.to_string()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "default_pipeline_unchanged".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "protocol".to_string(),
+            protocol
+                .map(|value| serde_json::Value::String(value.to_string()))
+                .unwrap_or_else(|| {
+                    object
+                        .get("protocol")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::String("none".to_string()))
+                }),
+        );
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::Value::Object(object))?
+        );
+        return Ok(());
     }
 
+    println!(
+        "Protocol: {}",
+        protocol
+            .or_else(|| resp["protocol"].as_str())
+            .unwrap_or("none")
+    );
+    if let Some(execution_pipeline_id) = execution_pipeline_id {
+        println!("Execution pipeline: {execution_pipeline_id}");
+    }
+
+    if status == "paid" {
+        let amount = resp["payment"]["amount_display"].as_str().unwrap_or("?");
+        let pay_to = resp["payment"]["pay_to"].as_str().unwrap_or("?");
+        let charge_id = resp["payment"]["charge_id"].as_str().unwrap_or("?");
+        let resp_status = resp["response"]["status_code"].as_u64().unwrap_or(0);
+
+        let pay_to_short = if pay_to.len() > 10 {
+            format!("{}...{}", &pay_to[..6], &pay_to[pay_to.len() - 4..])
+        } else {
+            pay_to.to_string()
+        };
+
+        println!("💳 Payment required: {amount} USDC → {pay_to_short}");
+        println!("✅ Paid & received response ({resp_status})");
+        println!();
+        println!("Payment:");
+        println!("  Amount:    {amount} USDC");
+        println!("  To:        {pay_to_short}");
+        println!("  Charge:    {charge_id}");
+        println!();
+        println!("Response:");
+    } else {
+        let resp_status = resp["response"]["status_code"].as_u64().unwrap_or(0);
+        println!("✅ Response ({resp_status}) — no payment required");
+        println!();
+        println!("Response:");
+    }
+
+    let body = resp["response"]["body"].as_str().unwrap_or("");
+    println!("{body}");
     Ok(())
 }
 
@@ -2183,6 +2526,30 @@ mod tests {
     }
 
     #[test]
+    fn test_build_payment_request_body_uses_camel_case_fields() {
+        let body = build_payment_request_body(
+            "https://example.com/pay",
+            "post",
+            HashMap::from([("x-test".to_string(), "1".to_string())]),
+            Some(serde_json::json!({"hello":"world"})),
+            143,
+            Some("1000000".to_string()),
+            "mpp".to_string(),
+            Some("monad".to_string()),
+            Some("route-base".to_string()),
+            Some("route-monad".to_string()),
+        );
+
+        assert_eq!(body.get("chainId").and_then(|v| v.as_u64()), Some(143));
+        assert_eq!(
+            body.get("executionPipelineId").and_then(|v| v.as_str()),
+            Some("route-monad")
+        );
+        assert!(body.get("chain_id").is_none());
+        assert!(body.get("execution_pipeline_id").is_none());
+    }
+
+    #[test]
     fn test_format_usdc_amount_small_values() {
         assert_eq!(format_usdc_amount(1200), "$0.001200");
         assert_eq!(format_usdc_amount(12_000), "$0.0120");
@@ -2259,8 +2626,33 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Pipelines {
-                action: Some(PipelineAction::Create)
+                action: Some(PipelineAction::Create {
+                    chain: None,
+                    for_pay: None
+                })
             }
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_create_targeted_args_parse() {
+        let cli = Cli::parse_from([
+            "facto",
+            "pipeline",
+            "create",
+            "--chain",
+            "monad",
+            "--for-pay",
+            "https://api.example/pay",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Commands::Pipelines {
+                action: Some(PipelineAction::Create {
+                    chain,
+                    for_pay
+                })
+            } if chain.as_deref() == Some("monad") && for_pay.as_deref() == Some("https://api.example/pay")
         ));
     }
 
@@ -2473,6 +2865,22 @@ mod tests {
         let err = ensure_user_bearer_auth(&creds).unwrap_err().to_string();
         assert!(err.contains("API key authentication is not supported"));
     }
+
+    #[test]
+    fn test_fund_spend_mode_uses_route_spend_mode() {
+        let route = serde_json::json!({
+            "spend_mode": "borrow"
+        });
+
+        assert_eq!(fund_spend_mode(&route), "borrow");
+    }
+
+    #[test]
+    fn test_fund_spend_mode_defaults_to_withdraw() {
+        let route = serde_json::json!({});
+
+        assert_eq!(fund_spend_mode(&route), "withdraw");
+    }
 }
 
 async fn cmd_services(query: Option<&str>, category: Option<&str>, terse: bool) -> Result<()> {
@@ -2622,23 +3030,24 @@ fn cmd_logout() -> Result<()> {
 /// Supported chains for `facto fund` (charge execution).
 /// Other chains are visible in `pipelines` but cannot be funded via CLI yet.
 const SUPPORTED_FUND_CHAINS: &[u64] = &[
-    4217, // Tempo (direct transfer)
-    143,  // Monad (x402 agentic payments)
+    143, // Monad (x402 agentic payments)
     8453, // Base (x402 agentic payments, Aave V3)
-          // 42161, // Arbitrum (cross-chain, requires bridge)
-          // 42431, // Tempo Testnet
+         // 42161, // Arbitrum (cross-chain, requires bridge)
+         // 42431, // Tempo Testnet
 ];
 
 fn is_fund_supported(chain_id: u64) -> bool {
     SUPPORTED_FUND_CHAINS.contains(&chain_id)
 }
 
+fn fund_spend_mode(route: &serde_json::Value) -> &str {
+    route["spend_mode"].as_str().unwrap_or("withdraw")
+}
+
 fn chain_display_name(chain_id: u64) -> String {
     match chain_id {
         42161 => "Arbitrum".to_string(),
         421614 => "Arbitrum Sepolia".to_string(),
-        4217 => "Tempo".to_string(),
-        42431 => "Tempo Testnet".to_string(),
         143 => "Monad".to_string(),
         8453 => "Base".to_string(),
         1329 => "Sei".to_string(),

@@ -3,27 +3,33 @@
 [![Crates.io](https://img.shields.io/crates/v/facto-cli.svg)](https://crates.io/crates/facto-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-DeFi-funded Agent payments via [x402 protocol](https://www.x402.org/).
+DeFi-funded agent payments via [x402](https://www.x402.org/) and Monad MPP.
 
-Facto CLI withdraws USDC from your DeFi positions (Aave V3, Morpho) and pays x402-enabled APIs automatically. Built for AI agents and developers who need programmatic access to paid APIs without managing wallets manually.
+Facto CLI withdraws USDC from your DeFi positions (Aave V3, Morpho) and pays machine-priced APIs automatically. Today that means:
+
+- Base-first `x402`
+- Monad-first MPP with `monad/charge`
+
+The CLI is built for AI agents and operators who want one command flow for login, funding, and payment without hand-managing wallet transactions.
 
 ## How It Works
 
 ```
 Your DeFi Position (Aave V3 / Morpho)
         |
-        | facto fund (withdraw USDC)
+        | facto fund / auto-fund
         v
-  Server Wallet (USDC)
+  Payment Wallet (USDC)
         |
-        | facto pay (automatic x402 signing)
+        | facto pay (auto x402 / Monad MPP)
         v
-  x402-enabled API  -->  Response
+  Paid API  -->  Response
 ```
 
-1. You deposit USDC into a DeFi protocol (Aave V3, Morpho) through [facto.xyz](https://facto.xyz)
-2. Facto CLI withdraws from your position on demand
-3. When calling a paid API, the CLI detects the `402 Payment Required` response, signs a USDC payment, and retries — all in one command
+1. You deposit USDC into a supported DeFi pipeline through [facto.xyz](https://facto.xyz)
+2. Facto CLI resolves the target payment protocol and chooses a compatible execution pipeline
+3. If the payment wallet is short, the CLI can auto-fund it from the selected pipeline
+4. The CLI retries the paid request after the payment challenge is satisfied
 
 Browser setup surfaces are deployment-aware: `facto login`, `facto pipeline create`, and other browser handoff links are sourced from the active Facto backend, so a frontend domain change does not require a separate CLI URL patch. If backend CLI metadata is temporarily unavailable, the CLI falls back to the agentic user frontend at `https://facto-pay-agentic.vercel.app`.
 
@@ -49,8 +55,10 @@ The binary is named `facto`. The bundled installer writes to `~/.facto/bin/facto
 # 1. Authenticate (opens browser for Privy OAuth)
 facto login
 
-# 2. Create your Base payment pipeline
+# 2. Create a payment pipeline
 facto pipeline create
+# Or open a Monad-specific create flow when testing Monad MPP
+facto pipeline create --chain monad
 
 # 3. Inspect operator state
 facto balance
@@ -63,8 +71,8 @@ After that, choose the path that matches how you work.
 
 - Install the latest `facto-cli` binary.
 - Authenticate the operator with `facto login`.
-- Link the Base payment pipeline with `facto pipeline create`.
-- Verify server wallet balance and active pipelines with `facto balance` and `facto pipelines`.
+- Link a payment pipeline with `facto pipeline create`.
+- Verify payment wallet balance and active pipelines with `facto balance` and `facto pipelines`.
 
 ## Use With An Agent
 
@@ -78,6 +86,12 @@ codex "Use facto-cli plus https://monad-api.facto.to/SKILL.md to find a low-cost
 - Catalog: `https://monad-api.facto.to/llms.txt`
 
 Your agent can decide whether it needs `facto services`, `facto pay`, `facto balance`, or `facto pipelines`.
+
+Notes:
+
+- `facto services` is still the x402 discovery surface.
+- Monad MPP services are paid by URL directly through `facto pay`.
+- `facto pay` defaults to `--protocol auto`, so it can route to either x402 or Monad MPP.
 
 Prompt starters:
 
@@ -93,8 +107,13 @@ claude "使用 facto-cli 和 https://monad-api.facto.to/SKILL.md，查找 Base �
 # 1. Discover x402 services yourself
 facto services "weather"
 
-# 2. Call a paid API — payment is handled automatically
+# 2. Call an x402 API — payment is handled automatically
 facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
+
+# 3. Call a Monad MPP API — protocol defaults to auto
+facto pay POST "http://localhost:8081/api/search" \
+  --data '{"query":"monad mpp","top_k":3}' \
+  --max-amount 0.001
 ```
 
 ## Commands
@@ -102,13 +121,13 @@ facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74
 | Command | Description |
 |---------|-------------|
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
-| `facto pipeline create` | Open the browser to create a Base payment pipeline |
+| `facto pipeline create` | Open the browser to create a payment pipeline (`--chain base|monad` supported) |
 | `facto whoami` | Diagnostic summary for the current operator account |
-| `facto balance` | Check server wallet USDC balance on the selected pipeline's chain, or a given chain |
+| `facto balance` | Check payment wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
-| `facto pipelines default [ID]` | Show or set the default pipeline used for auto-selected x402 chains |
+| `facto pipelines default [ID]` | Show or set the selected default pipeline used for auto-selected payments |
 | `facto fund --amount N` | Withdraw N USDC from a DeFi position to your wallet |
-| `facto pay METHOD URL` | Call an API with automatic x402 payment handling |
+| `facto pay METHOD URL` | Call an API with automatic x402 or Monad MPP payment handling |
 | `facto services [query]` | Discover x402-enabled services, optionally filtered by keyword |
 | `facto history` | Show past funding and payment transactions |
 | `facto config` | Configure deposit addresses for cross-chain transfers |
@@ -126,8 +145,7 @@ facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74
 | Chain | ID | Protocol | Use Case |
 |-------|----|----------|----------|
 | Base | 8453 | Aave V3 | x402 payments, fund withdrawals |
-| Monad | 143 | Morpho | x402 payments, fund withdrawals |
-| Tempo | 4217 | — | Fund withdrawals (direct transfer) |
+| Monad | 143 | Morpho | Monad MPP payments, fund withdrawals |
 
 ## Authentication
 
@@ -137,7 +155,7 @@ Facto CLI supports these authentication modes today:
 # Browser-based (default) — opens Privy OAuth flow
 facto login
 
-# First-time operator path — create the Base payment pipeline in the browser
+# First-time operator path — create a payment pipeline in the browser
 facto pipeline create
 
 # Dev token — for local testing only
@@ -157,7 +175,7 @@ The `-t` (terse) flag outputs structured JSON on every command, designed for pro
 ```bash
 # Call a paid API
 facto -t pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
-# => {"status":"paid","payment":{"amount":"5000","charge_id":"..."},"response":{"status_code":200,"body":"..."}}
+# => {"status":"paid","protocol":"x402|mpp","payment":{"charge_id":"...","reference":"0x..."},"response":{"status_code":200,"body":"..."}}
 
 # Discover services
 facto -t services "weather"
@@ -171,16 +189,16 @@ facto -t balance
 facto pipelines default <PIPELINE_ID>
 ```
 
-When `--chain` is omitted, `facto balance` and `facto pay` now prefer your selected default pipeline. If no default is set or it is no longer active, the CLI falls back to the first active pipeline.
+When `--chain` is omitted, `facto balance` and `facto pay` prefer your selected default pipeline. For `facto pay`, the CLI may temporarily use a different compatible execution pipeline for that one payment without changing your saved default.
 
 ### Typical Operator Workflow
 
 1. `facto login` — authenticate the CLI
-2. `facto pipeline create` — connect the Base payment pipeline
+2. `facto pipeline create` — connect a payment pipeline
 3. `facto balance` / `facto pipelines` — inspect payment capacity and pipeline selection
-4. Hand control to your agent, or use `facto services` and `facto pay` manually
-5. If balance is low: `facto fund --amount 5` — auto-selects pipeline
-6. `facto pipelines default <ID>` — pin the pipeline/chain used by `balance` and `pay`
+4. `facto pay` — let the CLI auto-resolve x402 vs Monad MPP
+5. If balance is low: `facto fund --amount 5` or let `facto pay` auto-fund when supported
+6. `facto pipelines default <ID>` — pin the pipeline/chain used as your selected default
 
 ## Configuration
 

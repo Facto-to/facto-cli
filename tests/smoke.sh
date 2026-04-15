@@ -28,6 +28,7 @@ FACTO="${FACTO_BIN:-$(command -v facto 2>/dev/null || echo "$HOME/.facto/bin/fac
 PASS=0
 FAIL=0
 SKIP=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -73,7 +74,7 @@ echo "────────────────────────�
 
 # ── Test 1: Health ──────────────────────────────────────────────────────
 
-echo -e "\n${BOLD}[1/8] Health Check${NC}"
+echo -e "\n${BOLD}[1/9] Health Check${NC}"
 HEALTH=$(curl -sf "$API_URL/health" 2>/dev/null || echo "")
 if [ "$HEALTH" = "ok" ]; then
   pass "API health endpoint returns ok"
@@ -83,7 +84,7 @@ fi
 
 # ── Test 2: Auth ────────────────────────────────────────────────────────
 
-echo -e "\n${BOLD}[2/8] Authentication${NC}"
+echo -e "\n${BOLD}[2/9] Authentication${NC}"
 WHOAMI=$(run "$FACTO" -t whoami 2>/dev/null || echo "")
 if echo "$WHOAMI" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['authenticated']==True" 2>/dev/null; then
   USER_ID=$(echo "$WHOAMI" | jq_field "['user_id']")
@@ -96,7 +97,7 @@ fi
 
 # ── Test 3: Pipelines ──────────────────────────────────────────────────
 
-echo -e "\n${BOLD}[3/8] Pipelines${NC}"
+echo -e "\n${BOLD}[3/9] Pipelines${NC}"
 PIPELINES=$(run "$FACTO" -t pipelines 2>/dev/null || echo "")
 PIPE_COUNT=$(echo "$PIPELINES" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('pipelines',[])))" 2>/dev/null || echo "0")
 if [ "$PIPE_COUNT" -gt 0 ]; then
@@ -108,7 +109,7 @@ fi
 
 # ── Test 4: Balance ─────────────────────────────────────────────────────
 
-echo -e "\n${BOLD}[4/8] Server Wallet Balance${NC}"
+echo -e "\n${BOLD}[4/9] Server Wallet Balance${NC}"
 BALANCE=$(run "$FACTO" -t balance --chain 8453 2>/dev/null || echo "")
 BAL_DISPLAY=$(echo "$BALANCE" | jq_field "['usdc_balance_display']" 2>/dev/null || echo "")
 WALLET=$(echo "$BALANCE" | jq_field "['wallet_address']" 2>/dev/null || echo "")
@@ -120,7 +121,7 @@ fi
 
 # ── Test 5: Service Discovery ───────────────────────────────────────────
 
-echo -e "\n${BOLD}[5/8] Service Discovery${NC}"
+echo -e "\n${BOLD}[5/9] Service Discovery${NC}"
 SERVICES=$(run "$FACTO" -t services "weather" 2>/dev/null || echo "")
 SVC_COUNT=$(echo "$SERVICES" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 if [ "$SVC_COUNT" -gt 0 ]; then
@@ -132,7 +133,7 @@ fi
 
 # ── Test 6: x402 Pay ───────────────────────────────────────────────────
 
-echo -e "\n${BOLD}[6/8] x402 Payment (live)${NC}"
+echo -e "\n${BOLD}[6/9] x402 Payment (live)${NC}"
 
 # Check balance sufficient (need at least $0.01 = 10000 raw units)
 RAW_BAL=$(echo "$BALANCE" | python3 -c "import sys,json; print(int(json.load(sys.stdin).get('usdc_balance','0')))" 2>/dev/null || echo "0")
@@ -160,7 +161,7 @@ fi
 
 # ── Test 7: History ─────────────────────────────────────────────────────
 
-echo -e "\n${BOLD}[7/8] Transaction History${NC}"
+echo -e "\n${BOLD}[7/9] Transaction History${NC}"
 HISTORY=$(run "$FACTO" -t history 2>/dev/null || echo "")
 HIST_COUNT=$(echo "$HISTORY" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 if [ "$HIST_COUNT" -gt 0 ]; then
@@ -171,7 +172,7 @@ fi
 
 # ── Test 8: Fund Dry-Run ───────────────────────────────────────────────
 
-echo -e "\n${BOLD}[8/8] Fund Dry-Run${NC}"
+echo -e "\n${BOLD}[8/9] Fund Dry-Run${NC}"
 if [ "$PIPE_COUNT" -gt 0 ]; then
   # Pick the first pipeline ID for dry-run (handles multi-pipeline accounts)
   FIRST_ROUTE=$(echo "$PIPELINES" | python3 -c "import sys,json; print(json.load(sys.stdin)['pipelines'][0]['route_id'])" 2>/dev/null || echo "")
@@ -185,6 +186,22 @@ if [ "$PIPE_COUNT" -gt 0 ]; then
   fi
 else
   skip "Fund dry-run" "no active pipelines"
+fi
+
+# ── Test 9: Local MPP Auto Pay ─────────────────────────────────────────
+
+echo -e "\n${BOLD}[9/9] Local MPP Auto Pay${NC}"
+if [ "${ENV:-}" = "local" ]; then
+  LOCAL_MPP_OUT="$(mktemp)"
+  if "$SCRIPT_DIR/mpp_local.sh" >"$LOCAL_MPP_OUT" 2>&1; then
+    pass "Local MPP auto pay"
+  else
+    OUTPUT="$(cat "$LOCAL_MPP_OUT")"
+    fail "Local MPP auto pay" "$OUTPUT"
+  fi
+  rm -f "$LOCAL_MPP_OUT"
+else
+  skip "Local MPP auto pay" "only runs against local engine"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────

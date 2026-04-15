@@ -126,10 +126,31 @@ fn normalize_frontend_url(frontend_url: &str) -> String {
 }
 
 pub fn pipeline_create_url_from_frontend(frontend_url: &str) -> String {
-    format!(
-        "{}/pipelines/create?source=cli&chain=base",
+    pipeline_create_url_from_frontend_and_chain(frontend_url, Some("base"))
+}
+
+pub fn pipeline_create_url_from_frontend_and_chain(
+    frontend_url: &str,
+    chain_hint: Option<&str>,
+) -> String {
+    let base = format!(
+        "{}/pipelines/create?source=cli",
         normalize_frontend_url(frontend_url)
-    )
+    );
+
+    match chain_hint.map(str::trim).filter(|chain| !chain.is_empty()) {
+        Some(chain) => format!("{base}&chain={chain}"),
+        None => base,
+    }
+}
+
+pub fn pipeline_create_url_for_pay(
+    frontend_url: &str,
+    target_url: &str,
+    chain_hint: Option<&str>,
+) -> String {
+    let base = pipeline_create_url_from_frontend_and_chain(frontend_url, chain_hint);
+    format!("{base}&forPay={}", urlencoding::encode(target_url))
 }
 
 pub fn pipeline_detail_url(frontend_url: &str, pipeline_id: &str) -> String {
@@ -231,6 +252,37 @@ mod tests {
         assert_eq!(
             meta.pipeline_create_url,
             "https://facto-pay-agentic.vercel.app/pipelines/create?source=cli&chain=base"
+        );
+    }
+
+    #[test]
+    fn pipeline_create_url_includes_target_chain() {
+        let url = pipeline_create_url_from_frontend_and_chain("https://app.facto", Some("monad"));
+
+        assert_eq!(
+            url,
+            "https://app.facto/pipelines/create?source=cli&chain=monad"
+        );
+    }
+
+    #[test]
+    fn pipeline_create_url_defaults_to_generic_flow_when_chain_missing() {
+        let url = pipeline_create_url_from_frontend_and_chain("https://app.facto", None);
+
+        assert_eq!(url, "https://app.facto/pipelines/create?source=cli");
+    }
+
+    #[test]
+    fn pipeline_create_url_for_pay_encodes_target_url() {
+        let url = pipeline_create_url_for_pay(
+            "https://app.facto",
+            "https://api.example/pay",
+            Some("monad"),
+        );
+
+        assert_eq!(
+            url,
+            "https://app.facto/pipelines/create?source=cli&chain=monad&forPay=https%3A%2F%2Fapi.example%2Fpay"
         );
     }
 }

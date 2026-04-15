@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-04-15
+
+### Added
+
+- `facto pay` now supports `--protocol auto|x402|mpp`, plus a resolve step that can temporarily choose a compatible execution pipeline without silently changing the user's selected default pipeline
+- Monad MPP now has dedicated CLI funding and balance paths through backend `/v1/mpp/balance` and `/v1/mpp/fund`, keeping the public MPP flow isolated from the older x402/card entry points
+
+### Changed
+
+- The CLI now documents a Monad-first MPP rollout: Base x402 remains supported, Monad `monad/charge` is the first MPP method exposed, and Tempo is no longer described as a public CLI payment path
+- `facto pay` can auto-fund the Monad payment wallet from the selected pipeline before retrying the MPP purchase, matching the existing x402 operator experience more closely
+- README and `SKILL.md` now explain the new `selected pipeline` versus `execution pipeline` model for automatic protocol and chain selection
+
 ## [0.5.8] - 2026-04-13
 
 ### Changed
@@ -133,6 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
 [0.5.7]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.7
+[0.5.9]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.9
 [0.5.8]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.8
 [0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
 [0.5.6]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.6

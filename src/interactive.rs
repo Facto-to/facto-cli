@@ -102,7 +102,15 @@ pub async fn interactive_service_flow(
         if !prompt_yn("Fund from Pipeline? [Y/n]")? {
             bail!("Payment cancelled — insufficient balance.");
         }
-        fund_from_pipeline(api, token, default_pipeline_id, max_amount_atomic).await?;
+        fund_from_pipeline(
+            api,
+            token,
+            default_pipeline_id,
+            max_amount_atomic,
+            true,
+            "x402",
+        )
+        .await?;
     }
 
     // Step 4: execute payment.
@@ -147,43 +155,90 @@ pub async fn confirm_before_pay(
     default_pipeline_id: Option<&str>,
     terse: bool,
     chain_id: u64,
+    protocol_label: &str,
+    auto_fund: bool,
+    prompt_payment: bool,
 ) -> Result<bool> {
-    // Agent / terse mode: skip all prompts.
-    if terse {
-        return Ok(true);
-    }
-
     // Check balance on the target chain.
+    let balance_path = payment_balance_path(protocol_label, chain_id);
     let balance_resp: Value = api
-        .get(
-            &format!("/v1/x402/balance?chain_id={chain_id}"),
-            Some(token),
-        )
+        .get(&balance_path, Some(token))
         .await
         .context("Failed to fetch balance")?;
 
     let balance_atomic = parse_balance_atomic(&balance_resp);
 
-    eprintln!();
-    eprintln!("  Target  : {url}");
-    eprintln!("  Max cost: {}", format_usdc_display(max_amount));
-    if max_amount == 0 {
-        eprintln!("  ⚠ Listed as free — actual charge may differ");
+    if !terse {
+        eprintln!();
+        eprintln!("  Target  : {url}");
+        eprintln!("  Protocol: {protocol_label}");
+        eprintln!("  Max cost: {}", format_usdc_display(max_amount));
+        if max_amount == 0 {
+            eprintln!("  ⚠ Listed as free — actual charge may differ");
+        }
+        if let Some(pipeline_id) = default_pipeline_id {
+            eprintln!("  Pipeline: {pipeline_id}");
+        }
+        eprintln!("  Balance : {}", format_usdc_display(balance_atomic));
+        eprintln!();
     }
-    eprintln!("  Balance : {}", format_usdc_display(balance_atomic));
-    eprintln!();
 
     if balance_atomic < max_amount {
         let deficit = max_amount.saturating_sub(balance_atomic);
-        eprintln!("  Deficit : {}", format_usdc_display(deficit));
-        eprintln!();
-        if prompt_yn("Fund from Pipeline? [Y/n]")? {
-            fund_from_pipeline(api, token, default_pipeline_id, max_amount).await?;
+        if !terse {
+            eprintln!("  Deficit : {}", format_usdc_display(deficit));
+            eprintln!();
+        }
+        if auto_fund {
+            fund_from_pipeline(
+                api,
+                token,
+                default_pipeline_id,
+                max_amount,
+                false,
+                protocol_label,
+            )
+            .await?;
         } else {
-            return Ok(false);
+            if prompt_yn(&format!("Fund via {protocol_label}? [Y/n]"))? {
+                fund_from_pipeline(
+                    api,
+                    token,
+                    default_pipeline_id,
+                    max_amount,
+                    true,
+                    protocol_label,
+                )
+                .await?;
+            } else {
+                return Ok(false);
+            }
         }
     }
 
+    if !prompt_payment {
+        return Ok(true);
+    }
+
+    prompt_yn("Proceed with payment? [Y/n]")
+}
+
+/// Lightweight confirmation for payment methods that do not have a reliable
+/// pre-payment balance/funding check in the CLI yet.
+pub fn confirm_payment_only(
+    url: &str,
+    max_amount: u64,
+    execution_pipeline_id: Option<&str>,
+    protocol_label: &str,
+) -> Result<bool> {
+    eprintln!();
+    eprintln!("  Target  : {url}");
+    eprintln!("  Protocol: {protocol_label}");
+    eprintln!("  Max cost: {}", format_usdc_display(max_amount));
+    if let Some(pipeline_id) = execution_pipeline_id {
+        eprintln!("  Pipeline: {pipeline_id}");
+    }
+    eprintln!();
     prompt_yn("Proceed with payment? [Y/n]")
 }
 
@@ -318,10 +373,7 @@ fn prompt_yn(question: &str) -> Result<bool> {
 #[allow(dead_code)]
 async fn check_balance(api: &FactoApi, token: &str, chain_id: u64) -> Result<String> {
     let resp: Value = api
-        .get(
-            &format!("/v1/x402/balance?chain_id={chain_id}"),
-            Some(token),
-        )
+        .get(&payment_balance_path("x402", chain_id), Some(token))
         .await
         .context("Failed to fetch balance")?;
     let atomic = parse_balance_atomic(&resp);
@@ -332,30 +384,36 @@ async fn check_balance(api: &FactoApi, token: &str, chain_id: u64) -> Result<Str
 async fn fund_from_pipeline(
     api: &FactoApi,
     token: &str,
-    default_pipeline_id: Option<&str>,
+    preferred_pipeline_id: Option<&str>,
     min_amount_atomic: u64,
+    prompt_for_amount: bool,
+    protocol_label: &str,
 ) -> Result<()> {
     // Resolve which pipeline to use.
-    let pipeline_id = select_funding_pipeline(api, token, default_pipeline_id).await?;
+    let pipeline_id = select_funding_pipeline(api, token, preferred_pipeline_id).await?;
 
-    // Suggest $5.00 or the minimum required amount, whichever is larger.
-    let suggested_atomic = min_amount_atomic.max(5_000_000); // $5.00 in 6-dec
-    let suggested_human = atomic_to_human(suggested_atomic);
+    let amount_human: f64 = if prompt_for_amount {
+        // Suggest $5.00 or the minimum required amount, whichever is larger.
+        let suggested_atomic = min_amount_atomic.max(5_000_000); // $5.00 in 6-dec
+        let suggested_human = atomic_to_human(suggested_atomic);
 
-    eprint!("Amount to fund (Enter = ${suggested_human}): ");
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("Failed to read user input")?;
-    let input = line.trim();
+        eprint!("Amount to fund (Enter = ${suggested_human}): ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("Failed to read user input")?;
+        let input = line.trim();
 
-    let amount_human: f64 = if input.is_empty() {
-        suggested_human
+        if input.is_empty() {
+            suggested_human
+        } else {
+            input
+                .parse::<f64>()
+                .context("Invalid amount — expected a number like 5 or 0.50")?
+        }
     } else {
-        input
-            .parse::<f64>()
-            .context("Invalid amount — expected a number like 5 or 0.50")?
+        atomic_to_human(min_amount_atomic)
     };
 
     if amount_human <= 0.0 {
@@ -363,7 +421,7 @@ async fn fund_from_pipeline(
     }
 
     // Try to execute the fund — if it fails, offer recovery options.
-    match try_fund(api, token, &pipeline_id, amount_human).await {
+    match try_fund(api, token, &pipeline_id, amount_human, protocol_label).await {
         Ok(()) => Ok(()),
         Err(e) => {
             let cli_meta = crate::pipeline_init::resolve_cli_meta(Some(api)).await;
@@ -392,7 +450,7 @@ async fn fund_from_pipeline(
                     "1" => {
                         // List all pipelines and let user pick a different one.
                         let alt_id = select_funding_pipeline(api, token, None).await?;
-                        return try_fund(api, token, &alt_id, amount_human).await;
+                        return try_fund(api, token, &alt_id, amount_human, protocol_label).await;
                     }
                     "2" => {
                         let url = crate::pipeline_init::pipeline_detail_url(
@@ -492,29 +550,20 @@ async fn select_funding_pipeline(
 }
 
 /// Attempt the actual fund operation.
-async fn try_fund(api: &FactoApi, token: &str, pipeline_id: &str, amount_human: f64) -> Result<()> {
+async fn try_fund(
+    api: &FactoApi,
+    token: &str,
+    pipeline_id: &str,
+    amount_human: f64,
+    protocol_label: &str,
+) -> Result<()> {
     let route: Value = api
         .get(&format!("/v1/routes/{pipeline_id}"), Some(token))
         .await
         .context("Failed to fetch pipeline details")?;
 
     let asset_decimals = route["asset_decimals"].as_u64().unwrap_or(6) as u32;
-
-    let me: Value = api
-        .get("/v1/auth/me", Some(token))
-        .await
-        .context("Failed to fetch user info")?;
-
-    let server_wallet = me["server_wallet"]
-        .as_str()
-        .or_else(|| me["wallet_address"].as_str())
-        .or_else(|| me["address"].as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if server_wallet.is_empty() {
-        bail!("Could not determine server wallet address.");
-    }
+    let chain_id = route["chain_id"].as_u64().unwrap_or(0);
 
     let factor = 10u64.pow(asset_decimals);
     let amount_atomic = (amount_human * factor as f64).round() as u64;
@@ -524,28 +573,166 @@ async fn try_fund(api: &FactoApi, token: &str, pipeline_id: &str, amount_human: 
     let rnd = rand_u16();
     let invoice_id = format!("CLI-FUND-{ts}-{rnd:04x}");
 
-    eprintln!("  Funding ${amount_human:.2} USDC from pipeline {pipeline_id}…");
+    if uses_mpp_funding(protocol_label) {
+        eprintln!("  Funding ${amount_human:.4} USDC from pipeline {pipeline_id} for Monad MPP…");
 
-    let asset_symbol = route["asset_symbol"].as_str().unwrap_or("USDC").to_string();
+        let payload = serde_json::json!({
+            "executionPipelineId": pipeline_id,
+            "amount": amount_atomic.to_string(),
+            "chainId": chain_id,
+        });
 
-    let payload = serde_json::json!({
-        "route_id": pipeline_id,
-        "invoice_id": invoice_id,
-        "underlying_amount": amount_atomic.to_string(),
-        "to": server_wallet,
-        "asset_symbol": asset_symbol,
-        "asset_decimals": asset_decimals,
-    });
+        let _: Value = api
+            .post_authenticated("/v1/mpp/fund", &payload, token)
+            .await
+            .context("Funding failed")?;
+
+        eprintln!("  Funding submitted. Waiting for payment wallet balance…");
+        wait_for_payment_balance(api, token, chain_id, amount_atomic, protocol_label).await?;
+        eprintln!("  ✓ Done.");
+        return Ok(());
+    }
+
+    let me: Value = api
+        .get("/v1/auth/me", Some(token))
+        .await
+        .context("Failed to fetch user info")?;
+
+    let payment_wallet = me["wallet_address"]
+        .as_str()
+        .filter(|a| !a.is_empty() && *a != "0x0000000000000000000000000000000000000000")
+        .or_else(|| me["server_wallet"].as_str())
+        .or_else(|| me["wallet_address"].as_str())
+        .or_else(|| me["address"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if payment_wallet.is_empty() {
+        bail!("Could not determine payment wallet address.");
+    }
+
+    ensure_recipient_allowlisted(api, token, &payment_wallet).await?;
+
+    eprintln!("  Funding ${amount_human:.4} USDC from pipeline {pipeline_id} → {payment_wallet}…");
+
+    let payload = build_execute_charge_payload(
+        &route,
+        &payment_wallet,
+        &payment_wallet,
+        amount_atomic,
+        &invoice_id,
+    )?;
 
     let _: Value = api
         .post_authenticated("/v1/charges/execute-7702", &payload, token)
         .await
         .context("Funding failed")?;
 
-    eprintln!("  Funding submitted. Waiting for balance…");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    eprintln!("  Funding submitted. Waiting for payment wallet balance…");
+    wait_for_payment_balance(api, token, chain_id, amount_atomic, protocol_label).await?;
     eprintln!("  ✓ Done.");
     Ok(())
+}
+
+async fn ensure_recipient_allowlisted(api: &FactoApi, token: &str, recipient: &str) -> Result<()> {
+    let allowlist: Vec<Value> = api
+        .get("/v1/recipients", Some(token))
+        .await
+        .context("Failed to fetch recipient allowlist")?;
+
+    let in_allowlist = allowlist.iter().any(|entry| {
+        entry["address"]
+            .as_str()
+            .map(|address| address.eq_ignore_ascii_case(recipient))
+            .unwrap_or(false)
+    });
+
+    if in_allowlist {
+        return Ok(());
+    }
+
+    let add_body = serde_json::json!({
+        "address": recipient,
+        "label": "Facto Payment Wallet",
+    });
+
+    let _: Value = api
+        .post_authenticated("/v1/recipients", &add_body, token)
+        .await
+        .context("Failed to add payment wallet to recipient allowlist")?;
+
+    Ok(())
+}
+
+fn build_execute_charge_payload(
+    route: &Value,
+    user_wallet: &str,
+    recipient_address: &str,
+    amount_atomic: u64,
+    invoice_id: &str,
+) -> Result<Value> {
+    let protocol_id = route["protocol_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Pipeline missing protocol_id"))?;
+    let yield_token = route["yield_token"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Pipeline missing yield_token"))?;
+    let eoa_address = route["eoa_address"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Pipeline missing eoa_address"))?;
+    let chain_id = route["chain_id"].as_u64();
+    let spend_mode = route["spend_mode"].as_str().unwrap_or("withdraw");
+
+    Ok(serde_json::json!({
+        "user_address": user_wallet,
+        "protocol_id": protocol_id,
+        "receipt_token": yield_token,
+        "underlying_amount": amount_atomic.to_string(),
+        "recipient_address": recipient_address,
+        "source_eoa_address": eoa_address,
+        "chain_id": chain_id,
+        "spend_mode": spend_mode,
+        "invoice_id": invoice_id,
+    }))
+}
+
+async fn wait_for_payment_balance(
+    api: &FactoApi,
+    token: &str,
+    chain_id: u64,
+    min_balance_atomic: u64,
+    protocol_label: &str,
+) -> Result<()> {
+    let balance_path = payment_balance_path(protocol_label, chain_id);
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        let balance: Value = api
+            .get(&balance_path, Some(token))
+            .await
+            .context("Failed to fetch payment wallet balance")?;
+        if parse_balance_atomic(&balance) >= min_balance_atomic {
+            return Ok(());
+        }
+    }
+
+    bail!("Funding submitted but payment wallet balance did not update in time.");
+}
+
+fn uses_mpp_funding(protocol_label: &str) -> bool {
+    protocol_label.eq_ignore_ascii_case("mpp")
+}
+
+fn payment_balance_path(protocol_label: &str, chain_id: u64) -> String {
+    if uses_mpp_funding(protocol_label) {
+        format!("/v1/mpp/balance?chain_id={chain_id}")
+    } else {
+        format!("/v1/x402/balance?chain_id={chain_id}")
+    }
 }
 
 /// Converts atomic USDC (6 decimals) to `"$X.XX"` display string.
@@ -594,6 +781,63 @@ fn parse_chain_id_from_service(service: &Value) -> u64 {
             .and_then(|s| s.parse().ok())
             .unwrap_or(8453),
         _ => 8453,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_execute_charge_payload, payment_balance_path, uses_mpp_funding};
+    use serde_json::json;
+
+    #[test]
+    fn builds_execute_charge_payload_for_payment_wallet_funding() {
+        let route = json!({
+            "protocol_id": "morpho",
+            "yield_token": "0xYield",
+            "eoa_address": "0x0000000000000000000000000000000000000e0a",
+            "chain_id": 143,
+            "spend_mode": "borrow",
+        });
+
+        let payload = build_execute_charge_payload(
+            &route,
+            "0x0000000000000000000000000000000000000abc",
+            "0x0000000000000000000000000000000000000abc",
+            1000,
+            "CLI-FUND-test",
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload["user_address"],
+            "0x0000000000000000000000000000000000000abc"
+        );
+        assert_eq!(
+            payload["recipient_address"],
+            "0x0000000000000000000000000000000000000abc"
+        );
+        assert_eq!(payload["protocol_id"], "morpho");
+        assert_eq!(payload["receipt_token"], "0xYield");
+        assert_eq!(
+            payload["source_eoa_address"],
+            "0x0000000000000000000000000000000000000e0a"
+        );
+        assert_eq!(payload["chain_id"], 143);
+        assert_eq!(payload["spend_mode"], "borrow");
+        assert_eq!(payload["underlying_amount"], "1000");
+    }
+
+    #[test]
+    fn mpp_uses_separate_balance_namespace() {
+        assert!(uses_mpp_funding("mpp"));
+        assert_eq!(
+            payment_balance_path("mpp", 143),
+            "/v1/mpp/balance?chain_id=143"
+        );
+        assert_eq!(
+            payment_balance_path("x402", 8453),
+            "/v1/x402/balance?chain_id=8453"
+        );
     }
 }
 

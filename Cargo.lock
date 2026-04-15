@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "facto-cli"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "atty",
