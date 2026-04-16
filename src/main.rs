@@ -2077,23 +2077,46 @@ fn print_payment_result(
     }
 
     if status == "paid" {
-        let amount = resp["payment"]["amount_display"].as_str().unwrap_or("?");
-        let pay_to = resp["payment"]["pay_to"].as_str().unwrap_or("?");
+        let amount = extract_payment_amount_display(resp);
+        let pay_to = extract_payment_destination(resp);
         let charge_id = resp["payment"]["charge_id"].as_str().unwrap_or("?");
         let resp_status = resp["response"]["status_code"].as_u64().unwrap_or(0);
+        let payment_method = resp["payment"]["method"].as_str();
+        let payment_intent = resp["payment"]["intent"].as_str();
+        let reference = resp["payment"]["reference"].as_str();
 
-        let pay_to_short = if pay_to.len() > 10 {
-            format!("{}...{}", &pay_to[..6], &pay_to[pay_to.len() - 4..])
-        } else {
-            pay_to.to_string()
-        };
+        let pay_to_short = pay_to.as_deref().map(shorten_payment_destination);
 
-        println!("💳 Payment required: {amount} USDC → {pay_to_short}");
+        match (&amount, &pay_to_short) {
+            (Some(amount), Some(pay_to_short)) => {
+                println!("💳 Payment required: {amount} USDC → {pay_to_short}");
+            }
+            (Some(amount), None) => {
+                println!("💳 Payment completed: {amount} USDC");
+            }
+            (None, Some(pay_to_short)) => {
+                println!("💳 Payment completed → {pay_to_short}");
+            }
+            (None, None) => {
+                println!("💳 Payment completed");
+            }
+        }
         println!("✅ Paid & received response ({resp_status})");
         println!();
         println!("Payment:");
-        println!("  Amount:    {amount} USDC");
-        println!("  To:        {pay_to_short}");
+        if let Some(amount) = amount {
+            println!("  Amount:    {amount} USDC");
+        }
+        if let Some(pay_to_short) = pay_to_short {
+            println!("  To:        {pay_to_short}");
+        }
+        if let Some(method) = payment_method {
+            let intent_suffix = payment_intent.map(|intent| format!(" / {intent}")).unwrap_or_default();
+            println!("  Method:    {method}{intent_suffix}");
+        }
+        if let Some(reference) = reference {
+            println!("  Reference: {reference}");
+        }
         println!("  Charge:    {charge_id}");
         println!();
         println!("Response:");
@@ -2107,6 +2130,38 @@ fn print_payment_result(
     let body = resp["response"]["body"].as_str().unwrap_or("");
     println!("{body}");
     Ok(())
+}
+
+fn extract_payment_amount_display(resp: &serde_json::Value) -> Option<String> {
+    if let Some(amount_display) = resp["payment"]["amount_display"].as_str() {
+        return Some(amount_display.to_string());
+    }
+
+    let raw_amount = resp["payment"]["amount"].as_str()?;
+    let raw_amount = raw_amount.parse::<u128>().ok()?;
+    let dollars = raw_amount as f64 / 1_000_000.0;
+
+    Some(if dollars < 1.0 {
+        format!("${:.4}", dollars)
+    } else {
+        format!("${:.2}", dollars)
+    })
+}
+
+fn extract_payment_destination(resp: &serde_json::Value) -> Option<String> {
+    resp["payment"]["pay_to"]
+        .as_str()
+        .or_else(|| resp["payment"]["recipient"].as_str())
+        .or_else(|| resp["payment"]["merchant"].as_str())
+        .map(|value| value.to_string())
+}
+
+fn shorten_payment_destination(value: &str) -> String {
+    if value.len() > 18 && value.starts_with("0x") {
+        format!("{}...{}", &value[..6], &value[value.len() - 4..])
+    } else {
+        value.to_string()
+    }
 }
 
 fn format_services_terse(items: &[serde_json::Value]) -> String {
