@@ -11,10 +11,12 @@ DeFi positions and pays x402 or Monad MPP services automatically.
 2. Login (opens browser):
    facto login
 
-3. Create a payment pipeline:
+3. Start pipeline setup in the browser:
    facto pipeline create
-   # For Monad MPP testing, you can open the Monad-specific create flow:
-   facto pipeline create --chain monad
+   # Agentic surfaces show the payment-surface chooser.
+   # Or jump straight to a surface:
+   facto pipeline create --x402
+   facto pipeline create --mpp
 
 4. Check operator state if needed:
    facto -t balance
@@ -67,7 +69,7 @@ facto -t pipelines
 | Command | Description |
 |---------|-------------|
 | facto login | Browser-based Privy authentication |
-| facto pipeline create | Open the browser to create a payment pipeline |
+| facto pipeline create | Open browser pipeline setup; agentic surfaces show the Base x402 / Monad MPP chooser |
 | facto whoami | Show account info |
 | facto services -t [query] | Discover x402 services (JSON) |
 | facto pay -t METHOD URL | Call API with automatic x402 or Monad MPP payment |

@@ -1,4 +1,4 @@
-//! Ensures the user has a default Base (chain_id=8453) pipeline before x402 commands.
+//! Resolves browser handoff URLs and pipeline selection helpers for Facto CLI.
 //!
 //! The main entry point is [`ensure_default_pipeline`], which resolves the active
 //! pipeline ID through a multi-step cache → backend → interactive flow.
@@ -126,7 +126,7 @@ fn normalize_frontend_url(frontend_url: &str) -> String {
 }
 
 pub fn pipeline_create_url_from_frontend(frontend_url: &str) -> String {
-    pipeline_create_url_from_frontend_and_chain(frontend_url, Some("base"))
+    pipeline_create_url_from_frontend_and_chain(frontend_url, None)
 }
 
 pub fn pipeline_create_url_from_frontend_and_chain(
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(meta.frontend_url, LEGACY_FRONTEND_URL);
         assert_eq!(
             meta.pipeline_create_url,
-            "https://facto-pay-agentic.vercel.app/pipelines/create?source=cli&chain=base"
+            "https://facto-pay-agentic.vercel.app/pipelines/create?source=cli"
         );
     }
 

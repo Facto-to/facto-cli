@@ -55,10 +55,13 @@ The binary is named `facto`. The bundled installer writes to `~/.facto/bin/facto
 # 1. Authenticate (opens browser for Privy OAuth)
 facto login
 
-# 2. Create a payment pipeline
+# 2. Start pipeline setup in the browser
 facto pipeline create
-# Or open a Monad-specific create flow when testing Monad MPP
-facto pipeline create --chain monad
+
+# On agentic surfaces this opens the payment-surface chooser.
+# Optional direct shortcuts:
+facto pipeline create --x402
+facto pipeline create --mpp
 
 # 3. Inspect operator state
 facto balance
@@ -127,7 +130,9 @@ Use `--yes` for copy-paste, agent-driven, and automation-friendly runs. It skips
 | Command | Description |
 |---------|-------------|
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
-| `facto pipeline create` | Open the browser to create a payment pipeline (`--chain base|monad` supported) |
+| `facto pipeline create` | Open the browser to start pipeline setup; agentic surfaces show the Base x402 / Monad MPP chooser |
+| `facto pipeline create --x402` | Jump straight to the Base x402 onboarding flow |
+| `facto pipeline create --mpp` | Jump straight to the Monad MPP onboarding flow |
 | `facto whoami` | Diagnostic summary for the current operator account |
 | `facto balance` | Check payment wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |

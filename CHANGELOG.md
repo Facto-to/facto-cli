@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-04-16
+
+### Added
+
+- `facto pipeline create` now supports `--x402` and `--mpp` as direct browser handoff shortcuts for Base x402 and Monad MPP pipeline setup
+
+### Changed
+
+- The default browser handoff for `facto pipeline create` is now neutral (`/pipelines/create?source=cli`) so agentic frontends can offer a payment-surface chooser without forcing Base-specific behavior
+- CLI setup docs, install output, and hosted install guidance now explain the shared chooser flow plus the direct `--x402` / `--mpp` shortcuts
+- Full-mode user frontends continue to fall back to the existing raw pipeline creation wizard instead of the agentic chooser/onboarding surface
+
 ## [0.6.0] - 2026-04-16
 
 ### Fixed
@@ -158,6 +170,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
 [0.5.7]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.7
+[0.6.1]: https://github.com/Facto-to/facto-cli/releases/tag/v0.6.1
 [0.6.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.6.0
 [0.5.9]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.9
 [0.5.8]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.8

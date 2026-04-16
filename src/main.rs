@@ -29,6 +29,15 @@ struct Cli {
 enum PipelineAction {
     /// Open the browser to create a payment pipeline.
     Create {
+        /// Optional payment protocol for the creation flow.
+        #[arg(long, value_parser = ["x402", "mpp"])]
+        protocol: Option<String>,
+        /// Jump straight to the Base x402 onboarding flow.
+        #[arg(long = "x402", conflicts_with_all = ["protocol", "mpp"])]
+        base_x402: bool,
+        /// Jump straight to the Monad MPP onboarding flow.
+        #[arg(long, conflicts_with_all = ["protocol", "base_x402"])]
+        mpp: bool,
         /// Optional target chain for the creation flow.
         #[arg(long, value_parser = ["base", "monad"])]
         chain: Option<String>,
@@ -204,8 +213,22 @@ async fn main() -> Result<()> {
         Commands::Whoami => cmd_whoami(cli.terse).await,
         Commands::Pipelines { action } => match action {
             None => cmd_pipelines(cli.terse).await,
-            Some(PipelineAction::Create { chain, for_pay }) => {
-                cmd_pipeline_create(cli.terse, chain.as_deref(), for_pay.as_deref()).await
+            Some(PipelineAction::Create {
+                protocol,
+                base_x402,
+                mpp,
+                chain,
+                for_pay,
+            }) => {
+                cmd_pipeline_create(
+                    cli.terse,
+                    protocol.as_deref(),
+                    base_x402,
+                    mpp,
+                    chain.as_deref(),
+                    for_pay.as_deref(),
+                )
+                .await
             }
             Some(PipelineAction::Show { id }) => cmd_pipeline_show(&id, cli.terse).await,
             Some(PipelineAction::Default { id }) => {
@@ -923,15 +946,43 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
 
 async fn cmd_pipeline_create(
     terse: bool,
+    protocol: Option<&str>,
+    base_x402: bool,
+    mpp: bool,
     chain: Option<&str>,
     for_pay: Option<&str>,
 ) -> Result<()> {
     let api = api::FactoApi::new();
     let meta = pipeline_init::resolve_cli_meta(Some(&api)).await;
-    let url = if let Some(target_url) = for_pay {
-        pipeline_init::pipeline_create_url_for_pay(&meta.frontend_url, target_url, chain)
+    let protocol_hint = if base_x402 {
+        Some("x402")
+    } else if mpp {
+        Some("mpp")
     } else {
-        pipeline_init::pipeline_create_url_from_frontend_and_chain(&meta.frontend_url, chain)
+        protocol.map(str::trim).filter(|value| !value.is_empty())
+    };
+    let explicit_chain = chain.map(str::trim).filter(|value| !value.is_empty());
+    let protocol_chain = match protocol_hint {
+        Some("x402") => Some("base"),
+        Some("mpp") => Some("monad"),
+        _ => None,
+    };
+    if let (Some(protocol_chain), Some(explicit_chain)) = (protocol_chain, explicit_chain) {
+        if protocol_chain != explicit_chain {
+            bail!("`--protocol {}` conflicts with `--chain {}`", protocol_hint.unwrap(), explicit_chain);
+        }
+    }
+    let chain_hint = explicit_chain.or(protocol_chain);
+    let url = if let Some(target_url) = for_pay {
+        pipeline_init::pipeline_create_url_for_pay(
+            &meta.frontend_url,
+            target_url,
+            chain_hint,
+        )
+    } else if let Some(chain) = chain_hint {
+        pipeline_init::pipeline_create_url_from_frontend_and_chain(&meta.frontend_url, Some(chain))
+    } else {
+        meta.pipeline_create_url.clone()
     };
     if terse {
         println!(
@@ -939,7 +990,8 @@ async fn cmd_pipeline_create(
             serde_json::to_string(&serde_json::json!({
                 "status": "pipeline_create_required",
                 "open_url": url,
-                "chain_hint": chain,
+                "protocol_hint": protocol_hint,
+                "chain_hint": chain_hint,
                 "for_pay": for_pay,
             }))?
         );
@@ -2682,6 +2734,9 @@ mod tests {
             cli.command,
             Commands::Pipelines {
                 action: Some(PipelineAction::Create {
+                    protocol: None,
+                    base_x402: false,
+                    mpp: false,
                     chain: None,
                     for_pay: None
                 })
@@ -2695,6 +2750,7 @@ mod tests {
             "facto",
             "pipeline",
             "create",
+            "--mpp",
             "--chain",
             "monad",
             "--for-pay",
@@ -2704,10 +2760,30 @@ mod tests {
             cli.command,
             Commands::Pipelines {
                 action: Some(PipelineAction::Create {
+                    protocol,
+                    base_x402,
+                    mpp,
                     chain,
                     for_pay
                 })
-            } if chain.as_deref() == Some("monad") && for_pay.as_deref() == Some("https://api.example/pay")
+            } if protocol.is_none() && !base_x402 && mpp && chain.as_deref() == Some("monad") && for_pay.as_deref() == Some("https://api.example/pay")
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_create_x402_shortcut_parses() {
+        let cli = Cli::parse_from(["facto", "pipeline", "create", "--x402"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Pipelines {
+                action: Some(PipelineAction::Create {
+                    protocol,
+                    base_x402,
+                    mpp,
+                    chain,
+                    for_pay
+                })
+            } if protocol.is_none() && base_x402 && !mpp && chain.is_none() && for_pay.is_none()
         ));
     }
 
@@ -2743,7 +2819,7 @@ mod tests {
         assert_eq!(meta.frontend_url, "https://user.example");
         assert_eq!(
             meta.pipeline_create_url,
-            "https://user.example/pipelines/create?source=cli&chain=base"
+            "https://user.example/pipelines/create?source=cli"
         );
     }
 
@@ -2756,7 +2832,7 @@ mod tests {
             2,
             serde_json::json!({
                 "frontend_url": "https://user.example",
-                "pipeline_create_url": "https://user.example/pipelines/create?source=cli&chain=base"
+                "pipeline_create_url": "https://user.example/pipelines/create?source=cli"
             }),
             serde_json::json!([]),
             serde_json::json!({}),
@@ -2775,7 +2851,7 @@ mod tests {
         assert_eq!(readiness.next_command, Some("facto pipeline create"));
         assert_eq!(
             readiness.continue_url.as_deref(),
-            Some("https://user.example/pipelines/create?source=cli&chain=base")
+            Some("https://user.example/pipelines/create?source=cli")
         );
         assert_eq!(
             requests.lock().unwrap().clone(),
@@ -2792,7 +2868,7 @@ mod tests {
             2,
             serde_json::json!({
                 "frontend_url": "https://user.example",
-                "pipeline_create_url": "https://user.example/pipelines/create?source=cli&chain=base"
+                "pipeline_create_url": "https://user.example/pipelines/create?source=cli"
             }),
             serde_json::json!([
                 {
@@ -2826,7 +2902,7 @@ mod tests {
             2,
             serde_json::json!({
                 "frontend_url": "https://user.example",
-                "pipeline_create_url": "https://user.example/pipelines/create?source=cli&chain=base"
+                "pipeline_create_url": "https://user.example/pipelines/create?source=cli"
             }),
             serde_json::json!([
                 {
