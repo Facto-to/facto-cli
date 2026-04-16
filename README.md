@@ -104,17 +104,23 @@ claude "使用 facto-cli 和 https://monad-api.facto.to/SKILL.md，查找 Base �
 ## Use Manually
 
 ```bash
-# 1. Discover x402 services yourself
+# 1. Discover services yourself
 facto services "weather"
 
-# 2. Call an x402 API — payment is handled automatically
-facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
+# 2. Call an x402 API
+facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0" \
+  --max-amount 0.001 \
+  --yes
 
-# 3. Call a Monad MPP API — protocol defaults to auto
-facto pay POST "http://localhost:8081/api/search" \
-  --data '{"query":"monad mpp","top_k":3}' \
-  --max-amount 0.001
+# 3. Call a Monad MPP API
+facto pay POST "https://monad-mpp.facto.to/api/sec-edgar/submissions" \
+  --protocol mpp \
+  --data '{"cik":"320193"}' \
+  --max-amount 0.001 \
+  --yes
 ```
+
+Use `--yes` for copy-paste, agent-driven, and automation-friendly runs. It skips the confirmation prompts and, when the execution wallet is short, auto-funds the exact required amount before retrying the paid request.
 
 ## Commands
 
@@ -174,8 +180,8 @@ The `-t` (terse) flag outputs structured JSON on every command, designed for pro
 
 ```bash
 # Call a paid API
-facto -t pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
-# => {"status":"paid","protocol":"x402|mpp","payment":{"charge_id":"...","reference":"0x..."},"response":{"status_code":200,"body":"..."}}
+facto -t pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0" --yes
+# => {"status":"paid","protocol":"x402|mpp","payment":{"charge_id":"...","reference":"0x...","amount_display":"$0.0010"},"response":{"status_code":200,"body":"..."}}
 
 # Discover services
 facto -t services "weather"

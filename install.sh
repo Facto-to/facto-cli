@@ -122,5 +122,5 @@ echo "  codex \"Use facto-cli plus SKILL.md to find a low-cost BTC price API, pa
 echo ""
 echo "Manual path:"
 echo "  facto services \"crypto\""
-echo "  facto pay GET \"<url>\" --max-amount 0.001"
+echo "  facto pay GET \"<url>\" --max-amount 0.001 --yes"
 echo ""

@@ -32,11 +32,13 @@ Point the runtime at:
 
 ## Call Paid APIs
 
-facto pay -t GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0"
+facto pay -t GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0" --yes
 
 Calls the URL. If the API requires x402 payment, Facto handles
 signing and payment automatically. For Monad MPP services, use the direct URL
 and keep `--protocol auto` unless you need to force `--protocol mpp`.
+Use `--yes` for agent and automation paths so the run does not stop on
+interactive funding or payment prompts.
 
 ## Discover Services
 
@@ -51,7 +53,7 @@ This is still the x402 discovery surface; Monad MPP services are paid by direct 
 2. facto pipeline create → create a payment pipeline
 3. facto -t balance / facto -t pipelines → inspect capacity when needed
 4. If the target URL is unknown: facto -t services "<keyword>" → find the right API
-5. facto -t pay GET|POST "<url>" → CLI auto-resolves x402 vs Monad MPP
+5. facto -t pay GET|POST "<url>" --yes → CLI auto-resolves x402 vs Monad MPP
 6. If the payment wallet is short, `facto pay` may auto-fund from a compatible pipeline
 7. Retry only if the CLI reports a real payment failure
 
@@ -78,6 +80,7 @@ facto -t pipelines
 ## Rules
 
 - Always use -t flag for machine-readable JSON output
+- Prefer `--yes` for agent or automation runs so CLI does not pause on confirmations
 - facto pay defaults to `--protocol auto` and can route to either x402 or Monad MPP
 - `facto login` only authenticates; first-time users still need `facto pipeline create`
 - After setup, agents should start from a concrete task and only use `facto services` when discovery is actually needed

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-16
+
+### Fixed
+
+- Successful Monad MPP payments now surface complete CLI payment summaries, including amount, recipient, method, and on-chain reference instead of `?` placeholders
+- MPP pay-route tests no longer race on duplicate rustls crypto-provider installation during repeated test setup
+
+### Changed
+
+- Public CLI examples now default to `--yes` for copy-paste, agent, and automation flows so runs do not stop on interactive funding and confirmation prompts
+- `llms.txt`, installer output, and the seeded MPP catalog examples now reflect the same non-interactive `facto pay ... --yes` guidance
+
 ## [0.5.9] - 2026-04-15
 
 ### Added
@@ -146,6 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for Base (8453), Monad (143), and Tempo (4217) chains
 
 [0.5.7]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.7
+[0.6.0]: https://github.com/Facto-to/facto-cli/releases/tag/v0.6.0
 [0.5.9]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.9
 [0.5.8]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.8
 [0.5.4]: https://github.com/Facto-to/facto-cli/releases/tag/v0.5.4
