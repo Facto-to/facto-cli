@@ -364,10 +364,12 @@ fn resolve_pipeline_create_target(
         protocol.map(str::trim).filter(|value| !value.is_empty())
     };
     let explicit_chain = chain.map(str::trim).filter(|value| !value.is_empty());
-    let protocol_chain = match protocol_hint {
-        Some("x402") => Some("base"),
-        Some("mpp") => Some("monad"),
-        _ => None,
+    let protocol_chain = if base_x402 {
+        Some("base")
+    } else if monad_x402 || mpp {
+        Some("monad")
+    } else {
+        None
     };
 
     if let (Some(protocol_chain), Some(explicit_chain)) = (protocol_chain, explicit_chain) {
@@ -2918,6 +2920,33 @@ mod tests {
             resolve_pipeline_create_target(Some("x402"), false, false, false, Some("monad"))
                 .expect("target should resolve");
         assert_eq!(target, PipelineCreateTarget::Surface("monad-x402"));
+    }
+
+    #[test]
+    fn test_pipeline_create_protocol_x402_chain_monad_resolves() {
+        let cli = Cli::parse_from([
+            "facto",
+            "pipeline",
+            "create",
+            "--protocol",
+            "x402",
+            "--chain",
+            "monad",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Commands::Pipelines {
+                action: Some(PipelineAction::Create {
+                    protocol,
+                    base_x402,
+                    monad_x402,
+                    mpp,
+                    chain,
+                    for_pay
+                })
+            } if protocol.as_deref() == Some("x402") && !base_x402 && !monad_x402 && !mpp && chain.as_deref() == Some("monad") && for_pay.is_none()
+        ));
     }
 
     #[test]
