@@ -1,7 +1,7 @@
 # Facto — DeFi-Funded Agent Payments
 
 Use this skill to call paid APIs. Facto withdraws USDC from your
-DeFi positions and pays x402 or Monad MPP services automatically.
+DeFi positions and pays Base x402, Monad x402, or Monad MPP services automatically.
 
 ## Setup (one-time, requires user interaction)
 
@@ -16,6 +16,7 @@ DeFi positions and pays x402 or Monad MPP services automatically.
    # Agentic surfaces show the payment-surface chooser.
    # Or jump straight to a surface:
    facto pipeline create --x402
+   facto pipeline create --monad-x402
    facto pipeline create --mpp
 
 4. Check operator state if needed:
@@ -37,7 +38,7 @@ Point the runtime at:
 facto pay -t GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74.0" --yes
 
 Calls the URL. If the API requires x402 payment, Facto handles
-signing and payment automatically. For Monad MPP services, use the direct URL
+signing and payment automatically. For Monad x402 or Monad MPP services, use the direct URL
 and keep `--protocol auto` unless you need to force `--protocol mpp`.
 Use `--yes` for agent and automation paths so the run does not stop on
 interactive funding or payment prompts.
@@ -55,7 +56,7 @@ This is still the x402 discovery surface; Monad MPP services are paid by direct 
 2. facto pipeline create → create a payment pipeline
 3. facto -t balance / facto -t pipelines → inspect capacity when needed
 4. If the target URL is unknown: facto -t services "<keyword>" → find the right API
-5. facto -t pay GET|POST "<url>" --yes → CLI auto-resolves x402 vs Monad MPP
+5. facto -t pay GET|POST "<url>" --yes → CLI auto-resolves Base x402 vs Monad x402 vs Monad MPP
 6. If the payment wallet is short, `facto pay` may auto-fund from a compatible pipeline
 7. Retry only if the CLI reports a real payment failure
 
@@ -69,10 +70,11 @@ facto -t pipelines
 | Command | Description |
 |---------|-------------|
 | facto login | Browser-based Privy authentication |
-| facto pipeline create | Open browser pipeline setup; agentic surfaces show the Base x402 / Monad MPP chooser |
+| facto pipeline create | Open browser pipeline setup; agentic surfaces show the Base x402 / Monad x402 / Monad MPP chooser |
+| facto pipeline create --monad-x402 | Jump straight to Monad x402 onboarding |
 | facto whoami | Show account info |
 | facto services -t [query] | Discover x402 services (JSON) |
-| facto pay -t METHOD URL | Call API with automatic x402 or Monad MPP payment |
+| facto pay -t METHOD URL | Call API with automatic Base x402, Monad x402, or Monad MPP payment |
 | facto balance -t | Check payment wallet USDC balance |
 | facto pipelines -t | Check DeFi pipeline balance |
 | facto fund --amount N | Withdraw N USDC from DeFi to wallet |
@@ -83,7 +85,7 @@ facto -t pipelines
 
 - Always use -t flag for machine-readable JSON output
 - Prefer `--yes` for agent or automation runs so CLI does not pause on confirmations
-- facto pay defaults to `--protocol auto` and can route to either x402 or Monad MPP
+- facto pay defaults to `--protocol auto` and can route to Base x402, Monad x402, or Monad MPP
 - `facto login` only authenticates; first-time users still need `facto pipeline create`
 - After setup, agents should start from a concrete task and only use `facto services` when discovery is actually needed
 - After setup, operators usually stop at `facto balance` / `facto pipelines` and hand control to the agent

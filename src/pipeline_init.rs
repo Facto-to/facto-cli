@@ -126,22 +126,46 @@ fn normalize_frontend_url(frontend_url: &str) -> String {
 }
 
 pub fn pipeline_create_url_from_frontend(frontend_url: &str) -> String {
-    pipeline_create_url_from_frontend_and_chain(frontend_url, None)
+    pipeline_create_url_from_frontend_and_surface(frontend_url, None)
 }
 
-pub fn pipeline_create_url_from_frontend_and_chain(
+pub fn pipeline_create_url_from_frontend_and_surface(
     frontend_url: &str,
-    chain_hint: Option<&str>,
+    surface_hint: Option<&str>,
 ) -> String {
     let base = format!(
         "{}/pipelines/create?source=cli",
         normalize_frontend_url(frontend_url)
     );
 
+    match surface_hint
+        .map(str::trim)
+        .filter(|surface| !surface.is_empty())
+    {
+        Some(surface) => format!("{base}&surface={surface}"),
+        None => base,
+    }
+}
+
+pub fn pipeline_create_url_from_frontend_and_chain(
+    frontend_url: &str,
+    chain_hint: Option<&str>,
+) -> String {
+    let base = pipeline_create_url_from_frontend_and_surface(frontend_url, None);
+
     match chain_hint.map(str::trim).filter(|chain| !chain.is_empty()) {
         Some(chain) => format!("{base}&chain={chain}"),
         None => base,
     }
+}
+
+pub fn pipeline_create_url_for_pay_with_surface(
+    frontend_url: &str,
+    target_url: &str,
+    surface_hint: Option<&str>,
+) -> String {
+    let base = pipeline_create_url_from_frontend_and_surface(frontend_url, surface_hint);
+    format!("{base}&forPay={}", urlencoding::encode(target_url))
 }
 
 pub fn pipeline_create_url_for_pay(
@@ -273,6 +297,17 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_create_url_includes_surface_hint() {
+        let url =
+            pipeline_create_url_from_frontend_and_surface("https://app.facto", Some("monad-x402"));
+
+        assert_eq!(
+            url,
+            "https://app.facto/pipelines/create?source=cli&surface=monad-x402"
+        );
+    }
+
+    #[test]
     fn pipeline_create_url_for_pay_encodes_target_url() {
         let url = pipeline_create_url_for_pay(
             "https://app.facto",
@@ -283,6 +318,20 @@ mod tests {
         assert_eq!(
             url,
             "https://app.facto/pipelines/create?source=cli&chain=monad&forPay=https%3A%2F%2Fapi.example%2Fpay"
+        );
+    }
+
+    #[test]
+    fn pipeline_create_url_for_pay_with_surface_encodes_target_url() {
+        let url = pipeline_create_url_for_pay_with_surface(
+            "https://app.facto",
+            "https://api.example/pay",
+            Some("monad-x402"),
+        );
+
+        assert_eq!(
+            url,
+            "https://app.facto/pipelines/create?source=cli&surface=monad-x402&forPay=https%3A%2F%2Fapi.example%2Fpay"
         );
     }
 }

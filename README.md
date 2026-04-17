@@ -8,6 +8,7 @@ DeFi-funded agent payments via [x402](https://www.x402.org/) and Monad MPP.
 Facto CLI withdraws USDC from your DeFi positions (Aave V3, Morpho) and pays machine-priced APIs automatically. Today that means:
 
 - Base-first `x402`
+- Monad `x402`
 - Monad-first MPP with `monad/charge`
 
 The CLI is built for AI agents and operators who want one command flow for login, funding, and payment without hand-managing wallet transactions.
@@ -21,7 +22,7 @@ Your DeFi Position (Aave V3 / Morpho)
         v
   Payment Wallet (USDC)
         |
-        | facto pay (auto x402 / Monad MPP)
+        | facto pay (auto Base x402 / Monad x402 / Monad MPP)
         v
   Paid API  -->  Response
 ```
@@ -61,6 +62,7 @@ facto pipeline create
 # On agentic surfaces this opens the payment-surface chooser.
 # Optional direct shortcuts:
 facto pipeline create --x402
+facto pipeline create --monad-x402
 facto pipeline create --mpp
 
 # 3. Inspect operator state
@@ -93,8 +95,8 @@ Your agent can decide whether it needs `facto services`, `facto pay`, `facto bal
 Notes:
 
 - `facto services` is still the x402 discovery surface.
-- Monad MPP services are paid by URL directly through `facto pay`.
-- `facto pay` defaults to `--protocol auto`, so it can route to either x402 or Monad MPP.
+- Monad x402 and Monad MPP services are still best treated as direct URL execution paths through `facto pay`.
+- `facto pay` defaults to `--protocol auto`, so it can route to Base x402, Monad x402, or Monad MPP.
 
 Prompt starters:
 
@@ -130,15 +132,16 @@ Use `--yes` for copy-paste, agent-driven, and automation-friendly runs. It skips
 | Command | Description |
 |---------|-------------|
 | `facto login` | Authenticate via browser (Privy OAuth) or dev token |
-| `facto pipeline create` | Open the browser to start pipeline setup; agentic surfaces show the Base x402 / Monad MPP chooser |
+| `facto pipeline create` | Open the browser to start pipeline setup; agentic surfaces show the Base x402 / Monad x402 / Monad MPP chooser |
 | `facto pipeline create --x402` | Jump straight to the Base x402 onboarding flow |
+| `facto pipeline create --monad-x402` | Jump straight to the Monad x402 onboarding flow |
 | `facto pipeline create --mpp` | Jump straight to the Monad MPP onboarding flow |
 | `facto whoami` | Diagnostic summary for the current operator account |
 | `facto balance` | Check payment wallet USDC balance on the selected pipeline's chain, or a given chain |
 | `facto pipelines` | List DeFi positions with real-time balance and spending limits |
 | `facto pipelines default [ID]` | Show or set the selected default pipeline used for auto-selected payments |
 | `facto fund --amount N` | Withdraw N USDC from a DeFi position to your wallet |
-| `facto pay METHOD URL` | Call an API with automatic x402 or Monad MPP payment handling |
+| `facto pay METHOD URL` | Call an API with automatic Base x402, Monad x402, or Monad MPP payment handling |
 | `facto services [query]` | Discover x402-enabled services, optionally filtered by keyword |
 | `facto history` | Show past funding and payment transactions |
 | `facto config` | Configure deposit addresses for cross-chain transfers |
@@ -156,7 +159,7 @@ Use `--yes` for copy-paste, agent-driven, and automation-friendly runs. It skips
 | Chain | ID | Protocol | Use Case |
 |-------|----|----------|----------|
 | Base | 8453 | Aave V3 | x402 payments, fund withdrawals |
-| Monad | 143 | Morpho | Monad MPP payments, fund withdrawals |
+| Monad | 143 | Morpho | Monad x402, Monad MPP, fund withdrawals |
 
 ## Authentication
 
@@ -207,7 +210,7 @@ When `--chain` is omitted, `facto balance` and `facto pay` prefer your selected 
 1. `facto login` — authenticate the CLI
 2. `facto pipeline create` — connect a payment pipeline
 3. `facto balance` / `facto pipelines` — inspect payment capacity and pipeline selection
-4. `facto pay` — let the CLI auto-resolve x402 vs Monad MPP
+4. `facto pay` — let the CLI auto-resolve Base x402 vs Monad x402 vs Monad MPP
 5. If balance is low: `facto fund --amount 5` or let `facto pay` auto-fund when supported
 6. `facto pipelines default <ID>` — pin the pipeline/chain used as your selected default
 

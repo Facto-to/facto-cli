@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `facto pipeline create --monad-x402` as a direct browser handoff shortcut for the Monad x402 setup surface
+
+### Changed
+
+- Agentic setup now follows a three-surface model: Base x402, Monad x402, and Monad MPP
+- `facto pipeline create --x402` remains pinned to Base for backward compatibility, while `--protocol x402 --chain monad` now resolves to the Monad x402 handoff
+- CLI docs, install output, and hosted install guidance now describe the three setup surfaces explicitly
+
 ## [0.6.1] - 2026-04-16
 
 ### Added

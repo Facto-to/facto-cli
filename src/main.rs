@@ -35,6 +35,9 @@ enum PipelineAction {
         /// Jump straight to the Base x402 onboarding flow.
         #[arg(long = "x402", conflicts_with_all = ["protocol", "mpp"])]
         base_x402: bool,
+        /// Jump straight to the Monad x402 onboarding flow.
+        #[arg(long = "monad-x402", conflicts_with_all = ["protocol", "base_x402", "mpp", "chain"])]
+        monad_x402: bool,
         /// Jump straight to the Monad MPP onboarding flow.
         #[arg(long, conflicts_with_all = ["protocol", "base_x402"])]
         mpp: bool,
@@ -216,6 +219,7 @@ async fn main() -> Result<()> {
             Some(PipelineAction::Create {
                 protocol,
                 base_x402,
+                monad_x402,
                 mpp,
                 chain,
                 for_pay,
@@ -224,6 +228,7 @@ async fn main() -> Result<()> {
                     cli.terse,
                     protocol.as_deref(),
                     base_x402,
+                    monad_x402,
                     mpp,
                     chain.as_deref(),
                     for_pay.as_deref(),
@@ -334,8 +339,65 @@ struct SessionPollResponse {
 #[derive(Debug, Deserialize)]
 struct LoginRouteStatus {
     id: String,
-    chain_id: u64,
     status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineCreateTarget {
+    Neutral,
+    Surface(&'static str),
+    LegacyChain(&'static str),
+}
+
+fn resolve_pipeline_create_target(
+    protocol: Option<&str>,
+    base_x402: bool,
+    monad_x402: bool,
+    mpp: bool,
+    chain: Option<&str>,
+) -> Result<PipelineCreateTarget> {
+    let protocol_hint = if base_x402 || monad_x402 {
+        Some("x402")
+    } else if mpp {
+        Some("mpp")
+    } else {
+        protocol.map(str::trim).filter(|value| !value.is_empty())
+    };
+    let explicit_chain = chain.map(str::trim).filter(|value| !value.is_empty());
+    let protocol_chain = match protocol_hint {
+        Some("x402") => Some("base"),
+        Some("mpp") => Some("monad"),
+        _ => None,
+    };
+
+    if let (Some(protocol_chain), Some(explicit_chain)) = (protocol_chain, explicit_chain) {
+        if protocol_chain != explicit_chain {
+            bail!(
+                "`--protocol {}` conflicts with `--chain {}`",
+                protocol_hint.unwrap(),
+                explicit_chain
+            );
+        }
+    }
+
+    if base_x402 {
+        return Ok(PipelineCreateTarget::Surface("base-x402"));
+    }
+    if monad_x402 {
+        return Ok(PipelineCreateTarget::Surface("monad-x402"));
+    }
+    if mpp {
+        return Ok(PipelineCreateTarget::Surface("monad-mpp"));
+    }
+
+    match (protocol_hint, explicit_chain) {
+        (Some("x402"), Some("monad")) => Ok(PipelineCreateTarget::Surface("monad-x402")),
+        (Some("x402"), _) => Ok(PipelineCreateTarget::Surface("base-x402")),
+        (Some("mpp"), _) => Ok(PipelineCreateTarget::Surface("monad-mpp")),
+        (None, Some("base")) => Ok(PipelineCreateTarget::LegacyChain("base")),
+        (None, Some("monad")) => Ok(PipelineCreateTarget::LegacyChain("monad")),
+        _ => Ok(PipelineCreateTarget::Neutral),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -948,49 +1010,75 @@ async fn cmd_pipeline_create(
     terse: bool,
     protocol: Option<&str>,
     base_x402: bool,
+    monad_x402: bool,
     mpp: bool,
     chain: Option<&str>,
     for_pay: Option<&str>,
 ) -> Result<()> {
     let api = api::FactoApi::new();
     let meta = pipeline_init::resolve_cli_meta(Some(&api)).await;
-    let protocol_hint = if base_x402 {
+    let protocol_hint = if base_x402 || monad_x402 {
         Some("x402")
     } else if mpp {
         Some("mpp")
     } else {
         protocol.map(str::trim).filter(|value| !value.is_empty())
     };
-    let explicit_chain = chain.map(str::trim).filter(|value| !value.is_empty());
-    let protocol_chain = match protocol_hint {
-        Some("x402") => Some("base"),
-        Some("mpp") => Some("monad"),
-        _ => None,
-    };
-    if let (Some(protocol_chain), Some(explicit_chain)) = (protocol_chain, explicit_chain) {
-        if protocol_chain != explicit_chain {
-            bail!("`--protocol {}` conflicts with `--chain {}`", protocol_hint.unwrap(), explicit_chain);
-        }
-    }
-    let chain_hint = explicit_chain.or(protocol_chain);
+    let target = resolve_pipeline_create_target(protocol, base_x402, monad_x402, mpp, chain)?;
     let url = if let Some(target_url) = for_pay {
-        pipeline_init::pipeline_create_url_for_pay(
-            &meta.frontend_url,
-            target_url,
-            chain_hint,
-        )
-    } else if let Some(chain) = chain_hint {
-        pipeline_init::pipeline_create_url_from_frontend_and_chain(&meta.frontend_url, Some(chain))
+        match target {
+            PipelineCreateTarget::Neutral => {
+                pipeline_init::pipeline_create_url_for_pay(&meta.frontend_url, target_url, None)
+            }
+            PipelineCreateTarget::Surface(surface) => {
+                pipeline_init::pipeline_create_url_for_pay_with_surface(
+                    &meta.frontend_url,
+                    target_url,
+                    Some(surface),
+                )
+            }
+            PipelineCreateTarget::LegacyChain(chain) => pipeline_init::pipeline_create_url_for_pay(
+                &meta.frontend_url,
+                target_url,
+                Some(chain),
+            ),
+        }
     } else {
-        meta.pipeline_create_url.clone()
+        match target {
+            PipelineCreateTarget::Neutral => meta.pipeline_create_url.clone(),
+            PipelineCreateTarget::Surface(surface) => {
+                pipeline_init::pipeline_create_url_from_frontend_and_surface(
+                    &meta.frontend_url,
+                    Some(surface),
+                )
+            }
+            PipelineCreateTarget::LegacyChain(chain) => {
+                pipeline_init::pipeline_create_url_from_frontend_and_chain(
+                    &meta.frontend_url,
+                    Some(chain),
+                )
+            }
+        }
     };
     if terse {
+        let surface_hint = match target {
+            PipelineCreateTarget::Surface(surface) => Some(surface),
+            _ => None,
+        };
+        let chain_hint = match target {
+            PipelineCreateTarget::LegacyChain(chain) => Some(chain),
+            PipelineCreateTarget::Surface("base-x402") => Some("base"),
+            PipelineCreateTarget::Surface("monad-x402" | "monad-mpp") => Some("monad"),
+            PipelineCreateTarget::Neutral => None,
+            PipelineCreateTarget::Surface(_) => None,
+        };
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
                 "status": "pipeline_create_required",
                 "open_url": url,
                 "protocol_hint": protocol_hint,
+                "surface_hint": surface_hint,
                 "chain_hint": chain_hint,
                 "for_pay": for_pay,
             }))?
@@ -2163,7 +2251,9 @@ fn print_payment_result(
             println!("  To:        {pay_to_short}");
         }
         if let Some(method) = payment_method {
-            let intent_suffix = payment_intent.map(|intent| format!(" / {intent}")).unwrap_or_default();
+            let intent_suffix = payment_intent
+                .map(|intent| format!(" / {intent}"))
+                .unwrap_or_default();
             println!("  Method:    {method}{intent_suffix}");
         }
         if let Some(reference) = reference {
@@ -2736,6 +2826,7 @@ mod tests {
                 action: Some(PipelineAction::Create {
                     protocol: None,
                     base_x402: false,
+                    monad_x402: false,
                     mpp: false,
                     chain: None,
                     for_pay: None
@@ -2762,11 +2853,12 @@ mod tests {
                 action: Some(PipelineAction::Create {
                     protocol,
                     base_x402,
+                    monad_x402,
                     mpp,
                     chain,
                     for_pay
                 })
-            } if protocol.is_none() && !base_x402 && mpp && chain.as_deref() == Some("monad") && for_pay.as_deref() == Some("https://api.example/pay")
+            } if protocol.is_none() && !base_x402 && !monad_x402 && mpp && chain.as_deref() == Some("monad") && for_pay.as_deref() == Some("https://api.example/pay")
         ));
     }
 
@@ -2779,12 +2871,67 @@ mod tests {
                 action: Some(PipelineAction::Create {
                     protocol,
                     base_x402,
+                    monad_x402,
                     mpp,
                     chain,
                     for_pay
                 })
-            } if protocol.is_none() && base_x402 && !mpp && chain.is_none() && for_pay.is_none()
+            } if protocol.is_none() && base_x402 && !monad_x402 && !mpp && chain.is_none() && for_pay.is_none()
         ));
+    }
+
+    #[test]
+    fn test_pipeline_create_monad_x402_shortcut_parses() {
+        let cli = Cli::parse_from(["facto", "pipeline", "create", "--monad-x402"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Pipelines {
+                action: Some(PipelineAction::Create {
+                    protocol,
+                    base_x402,
+                    monad_x402,
+                    mpp,
+                    chain,
+                    for_pay
+                })
+            } if protocol.is_none() && !base_x402 && monad_x402 && !mpp && chain.is_none() && for_pay.is_none()
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_create_monad_x402_conflicts_with_chain() {
+        let cli = Cli::try_parse_from([
+            "facto",
+            "pipeline",
+            "create",
+            "--monad-x402",
+            "--chain",
+            "monad",
+        ]);
+
+        assert!(cli.is_err());
+    }
+
+    #[test]
+    fn test_resolve_pipeline_create_target_maps_monad_x402_surface() {
+        let target =
+            resolve_pipeline_create_target(Some("x402"), false, false, false, Some("monad"))
+                .expect("target should resolve");
+        assert_eq!(target, PipelineCreateTarget::Surface("monad-x402"));
+    }
+
+    #[test]
+    fn test_resolve_pipeline_create_target_keeps_x402_shortcut_on_base() {
+        let target = resolve_pipeline_create_target(None, true, false, false, None)
+            .expect("target should resolve");
+        assert_eq!(target, PipelineCreateTarget::Surface("base-x402"));
+    }
+
+    #[test]
+    fn test_resolve_pipeline_create_target_defaults_chain_only_links_to_legacy_chain() {
+        let target = resolve_pipeline_create_target(None, false, false, false, Some("monad"))
+            .expect("target should resolve");
+        assert_eq!(target, PipelineCreateTarget::LegacyChain("monad"));
     }
 
     #[test]
