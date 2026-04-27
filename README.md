@@ -118,7 +118,7 @@ facto pay GET "https://x402.aurelianflo.com/api/weather/current?lat=40.7&lon=-74
   --yes
 
 # 3. Call a Monad MPP API
-facto pay POST "https://monad-api.facto.to/api/sec-edgar/submissions" \
+facto pay POST "https://monad-services.facto.to/api/sec-edgar/submissions" \
   --protocol mpp \
   --data '{"cik":"320193"}' \
   --max-amount 0.001 \
