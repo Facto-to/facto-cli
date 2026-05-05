@@ -488,9 +488,7 @@ async fn cmd_login(
     let facto = api::FactoApi::new();
 
     // 1. Create a CLI session → get session_id + auth_url
-    let session: SessionCreateResponse = facto
-        .post("/v1/cli/session", &serde_json::json!({}))
-        .await?;
+    let session: SessionCreateResponse = facto.post("/cli/session", &serde_json::json!({})).await?;
 
     if let Some(meta) = session_cli_meta(&session) {
         let _ = pipeline_init::cache_cli_meta(&meta);
@@ -504,7 +502,7 @@ async fn cmd_login(
     open::that(&session.auth_url).ok(); // best-effort; don't abort if it fails
 
     // 3. Poll until authenticated
-    let poll_path = format!("/v1/cli/session/{}", session.session_id);
+    let poll_path = format!("/cli/session/{}", session.session_id);
 
     if !terse {
         print!("Waiting for login... ");
@@ -590,7 +588,7 @@ async fn detect_post_login_readiness(
     token: &str,
 ) -> Result<PostLoginReadiness> {
     let cli_meta = pipeline_init::resolve_cli_meta(Some(api)).await;
-    let routes: Vec<LoginRouteStatus> = api.get("/v1/routes/me", Some(token)).await?;
+    let routes: Vec<LoginRouteStatus> = api.get("/api/routes/me", Some(token)).await?;
     let active_routes: Vec<LoginRouteStatus> = routes
         .into_iter()
         .filter(|route| route.status.eq_ignore_ascii_case("active"))
@@ -704,12 +702,12 @@ async fn cmd_whoami(terse: bool) -> Result<()> {
     ensure_user_bearer_auth(&creds)?;
 
     let me: serde_json::Value = api
-        .get("/v1/auth/me", Some(&creds.token))
+        .get("/api/auth/me", Some(&creds.token))
         .await
         .context("Failed to fetch authenticated account")?;
 
     let routes: Vec<serde_json::Value> = api
-        .get("/v1/routes/me", Some(&creds.token))
+        .get("/api/routes/me", Some(&creds.token))
         .await
         .context("Failed to fetch routes")?;
 
@@ -796,7 +794,7 @@ fn resolve_chain_id_from_routes(
 
 async fn preferred_pipeline_id(api: &api::FactoApi, token: &str) -> Option<String> {
     if let Ok(prefs) = api
-        .get::<serde_json::Value>("/v1/user/preferences", Some(token))
+        .get::<serde_json::Value>("/api/user/preferences", Some(token))
         .await
     {
         if let Some(default_pipeline_id) = prefs["default_pipeline_id"]
@@ -824,7 +822,7 @@ async fn resolve_chain_id(explicit: Option<u64>, api: &api::FactoApi, token: &st
     }
 
     let routes: Vec<serde_json::Value> = api
-        .get("/v1/routes/me", Some(token))
+        .get("/api/routes/me", Some(token))
         .await
         .context("Failed to fetch routes for chain auto-detection")?;
     let preferred_pipeline_id = preferred_pipeline_id(api, token).await;
@@ -838,7 +836,7 @@ async fn cmd_balance(chain: Option<u64>, terse: bool) -> Result<()> {
 
     let resp: serde_json::Value = api
         .get(
-            &format!("/v1/x402/balance?chain_id={chain_id}"),
+            &format!("/api/x402/balance?chain_id={chain_id}"),
             Some(&creds.token),
         )
         .await
@@ -862,7 +860,7 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
     ensure_user_bearer_auth(&creds)?;
 
     let routes: Vec<serde_json::Value> = api
-        .get("/v1/routes/me", Some(&creds.token))
+        .get("/api/routes/me", Some(&creds.token))
         .await
         .context("Failed to fetch routes")?;
 
@@ -878,7 +876,7 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
         .collect();
 
     let me: serde_json::Value = api
-        .get("/v1/auth/me", Some(&creds.token))
+        .get("/api/auth/me", Some(&creds.token))
         .await
         .context("Failed to fetch authenticated user")?;
 
@@ -900,8 +898,8 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
     }
 
     // Fetch real-time balance for each route via pre-check API
-    // Endpoint: GET /v1/charges/pre-check/{yield_token}/{eoa_address}/{spender}?chain_id={chain_id}
-    // The spender is the user's server wallet address (from /v1/auth/me or route eoa_address)
+    // Endpoint: GET /api/charges/pre-check/{yield_token}/{eoa_address}/{spender}?chain_id={chain_id}
+    // The spender is the user's server wallet address (from /api/auth/me or route eoa_address)
     let server_wallet = me["wallet_address"]
         .as_str()
         .filter(|a| !a.is_empty() && *a != "0x0000000000000000000000000000000000000000")
@@ -936,7 +934,7 @@ async fn cmd_pipelines(terse: bool) -> Result<()> {
             server_wallet
         };
         let pre_check_path = format!(
-            "/v1/charges/pre-check/{}/{}/{}?chain_id={}",
+            "/api/charges/pre-check/{}/{}/{}?chain_id={}",
             yield_token, eoa, spender, chain_id
         );
         let balance_human = match api
@@ -1100,7 +1098,7 @@ async fn cmd_pipeline_show(route_id: &str, terse: bool) -> Result<()> {
     ensure_user_bearer_auth(&creds)?;
 
     let route: serde_json::Value = api
-        .get(&format!("/v1/routes/{route_id}"), Some(&creds.token))
+        .get(&format!("/api/routes/{route_id}"), Some(&creds.token))
         .await
         .context("Failed to fetch pipeline details")?;
 
@@ -1149,7 +1147,7 @@ async fn cmd_pipeline_default(id: Option<&str>, terse: bool) -> Result<()> {
             // Set default
             let body = serde_json::json!({ "default_pipeline_id": pipeline_id });
             let resp: serde_json::Value = api
-                .put_authenticated("/v1/user/preferences", &body, &creds.token)
+                .put_authenticated("/api/user/preferences", &body, &creds.token)
                 .await
                 .context("Failed to set default pipeline")?;
 
@@ -1168,7 +1166,7 @@ async fn cmd_pipeline_default(id: Option<&str>, terse: bool) -> Result<()> {
         None => {
             // Show current default
             let prefs: serde_json::Value = api
-                .get("/v1/user/preferences", Some(&creds.token))
+                .get("/api/user/preferences", Some(&creds.token))
                 .await
                 .context("Failed to fetch preferences")?;
 
@@ -1210,7 +1208,7 @@ async fn cmd_fund(
 
     // Fetch routes
     let routes: Vec<serde_json::Value> = api
-        .get("/v1/routes/me", Some(&creds.token))
+        .get("/api/routes/me", Some(&creds.token))
         .await
         .context("Failed to fetch routes")?;
 
@@ -1325,7 +1323,7 @@ async fn cmd_fund(
     }
 
     let allowlist: Vec<serde_json::Value> = api
-        .get("/v1/recipients", Some(&creds.token))
+        .get("/api/recipients", Some(&creds.token))
         .await
         .context("Failed to fetch recipient allowlist")?;
 
@@ -1369,7 +1367,7 @@ async fn cmd_fund(
     }
 
     // Check if recipient is in user's allowlist; if not, offer to add.
-    // Engine validates against user-level recipients (/v1/recipients), not route-level.
+    // Engine validates against user-level recipients (/api/recipients), not route-level.
     if !in_allowlist {
         let label = if resolved_recipient == eoa_address {
             "Funding Source"
@@ -1380,7 +1378,7 @@ async fn cmd_fund(
 
         if terse {
             let _: serde_json::Value = api
-                .post_authenticated("/v1/recipients", &add_body, &creds.token)
+                .post_authenticated("/api/recipients", &add_body, &creds.token)
                 .await
                 .context("Failed to add recipient to allowlist")?;
         } else {
@@ -1398,7 +1396,7 @@ async fn cmd_fund(
                 return Ok(());
             }
             let _: serde_json::Value = api
-                .post_authenticated("/v1/recipients", &add_body, &creds.token)
+                .post_authenticated("/api/recipients", &add_body, &creds.token)
                 .await
                 .context("Failed to add recipient to allowlist")?;
             println!("   ✅ Added to allowlist.");
@@ -1409,7 +1407,7 @@ async fn cmd_fund(
 
     // ── Pre-check: verify DeFi position has sufficient balance ──────────
     let me: serde_json::Value = api
-        .get("/v1/auth/me", Some(&creds.token))
+        .get("/api/auth/me", Some(&creds.token))
         .await
         .context("Failed to fetch authenticated user")?;
     let user_wallet = me["wallet_address"]
@@ -1428,7 +1426,7 @@ async fn cmd_fund(
         .and_then(|v| v.as_u64())
         .unwrap_or(6);
     let pre_check_path = format!(
-        "/v1/charges/pre-check/{}/{}/{}?chain_id={}&amount={}",
+        "/api/charges/pre-check/{}/{}/{}?chain_id={}&amount={}",
         yield_token, eoa_address, spender, chain_id, atomic_str
     );
     let pipeline_balance_display = match api
@@ -1528,7 +1526,7 @@ async fn cmd_fund(
     });
 
     let resp: serde_json::Value = api
-        .post_authenticated("/v1/charges/execute-7702", &body, &creds.token)
+        .post_authenticated("/api/charges/execute-7702", &body, &creds.token)
         .await
         .context("Failed to execute charge")?;
 
@@ -1554,7 +1552,7 @@ async fn cmd_fund(
             print!("  Confirming on-chain");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
-        let balance_path = format!("/v1/x402/balance?chain_id={}", chain_id);
+        let balance_path = format!("/api/x402/balance?chain_id={}", chain_id);
         let mut confirmed: Option<String> = None;
         for attempt in 0..10 {
             if attempt > 0 {
@@ -1627,13 +1625,13 @@ async fn cmd_history(terse: bool) -> Result<()> {
 
     // Fetch user's wallet address from whoami/routes to get the correct address
     let routes: Vec<serde_json::Value> = api
-        .get("/v1/routes/me", Some(&creds.token))
+        .get("/api/routes/me", Some(&creds.token))
         .await
         .context("Failed to fetch routes")?;
 
     // Resolve user's server wallet address (charges are indexed by user_address = server wallet)
     let me: serde_json::Value = api
-        .get("/v1/auth/me", Some(&creds.token))
+        .get("/api/auth/me", Some(&creds.token))
         .await
         .context("Failed to fetch authenticated user")?;
     let user_wallet = me["wallet_address"]
@@ -1650,10 +1648,10 @@ async fn cmd_history(terse: bool) -> Result<()> {
                 .to_string()
         });
 
-    // Fetch charge history using /v1/charges/user/{address}
+    // Fetch charge history using /api/charges/user/{address}
     let charges: serde_json::Value = api
         .get(
-            &format!("/v1/charges/user/{}", user_wallet),
+            &format!("/api/charges/user/{}", user_wallet),
             Some(&creds.token),
         )
         .await
@@ -1975,7 +1973,7 @@ async fn cmd_pay(
         Some(execution_pipeline_id.clone()),
     );
 
-    let endpoint = pay::payment_endpoint(protocol_name.as_str()).unwrap_or("/v1/x402/pay");
+    let endpoint = pay::payment_endpoint(protocol_name.as_str()).unwrap_or("/api/x402/pay");
     let resp: serde_json::Value = api
         .post_authenticated(endpoint, &body, &creds.token)
         .await
@@ -1993,6 +1991,7 @@ async fn cmd_pay(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_payment_request_body(
     url: &str,
     method: &str,
@@ -2495,7 +2494,7 @@ mod tests {
                         requests.lock().unwrap().push(path.clone());
 
                         let (status, body) = match path.as_str() {
-                            "/v1/routes/me" => (
+                            "/api/routes/me" => (
                                 "200 OK",
                                 serde_json::json!([
                                     {
@@ -2511,14 +2510,14 @@ mod tests {
                                 ])
                                 .to_string(),
                             ),
-                            "/v1/user/preferences" => (
+                            "/api/user/preferences" => (
                                 "200 OK",
                                 serde_json::json!({
                                     "default_pipeline_id": "selected-pipeline"
                                 })
                                 .to_string(),
                             ),
-                            "/v1/x402/balance?chain_id=143" => (
+                            "/api/x402/balance?chain_id=143" => (
                                 "200 OK",
                                 serde_json::json!({
                                     "wallet_address": "0x0000000000000000000000000000000000000123",
@@ -2588,10 +2587,10 @@ mod tests {
                         requests.lock().unwrap().push(path.clone());
 
                         let (status, body) = match path.as_str() {
-                            "/v1/cli/meta" => ("200 OK", cli_meta_body.to_string()),
-                            "/v1/routes/me" => ("200 OK", routes_body.to_string()),
-                            "/v1/auth/me" => ("200 OK", me_body.to_string()),
-                            "/v1/authorizations/me/8453" => ("200 OK", auths_body.to_string()),
+                            "/cli/meta" => ("200 OK", cli_meta_body.to_string()),
+                            "/api/routes/me" => ("200 OK", routes_body.to_string()),
+                            "/api/auth/me" => ("200 OK", me_body.to_string()),
+                            "/api/authorizations/me/8453" => ("200 OK", auths_body.to_string()),
                             _ => (
                                 "404 Not Found",
                                 serde_json::json!({
@@ -3031,7 +3030,7 @@ mod tests {
         );
         assert_eq!(
             requests.lock().unwrap().clone(),
-            vec!["/v1/cli/meta".to_string(), "/v1/routes/me".to_string()]
+            vec!["/cli/meta".to_string(), "/api/routes/me".to_string()]
         );
     }
 
@@ -3146,9 +3145,9 @@ mod tests {
         server.join().unwrap();
 
         let requests = requests.lock().unwrap().clone();
-        assert_eq!(requests[0], "/v1/routes/me");
-        assert_eq!(requests[1], "/v1/user/preferences");
-        assert_eq!(requests[2], "/v1/x402/balance?chain_id=143");
+        assert_eq!(requests[0], "/api/routes/me");
+        assert_eq!(requests[1], "/api/user/preferences");
+        assert_eq!(requests[2], "/api/x402/balance?chain_id=143");
 
         let cfg = config::load_config();
         assert_eq!(
@@ -3194,7 +3193,7 @@ async fn cmd_services(query: Option<&str>, category: Option<&str>, terse: bool) 
     let api_base = config::api_url();
     let client = reqwest::Client::new();
 
-    let mut url = format!("{api_base}/v1/x402/discovery?page_size=100");
+    let mut url = format!("{api_base}/api/x402/discovery?page_size=100");
     if let Some(q) = query {
         url.push_str(&format!("&q={}", urlencoding::encode(q)));
     }

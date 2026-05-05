@@ -19,7 +19,7 @@ use crate::config;
 /// 1. Search services via the discovery API.
 /// 2. Display a formatted table and prompt the user to select one.
 /// 3. Check balance; prompt to fund if insufficient.
-/// 4. Confirm and execute payment via `POST /v1/x402/pay`.
+/// 4. Confirm and execute payment via `POST /api/x402/pay`.
 /// 5. Print the response body to stdout.
 pub async fn interactive_service_flow(
     query: Option<&str>,
@@ -71,7 +71,7 @@ pub async fn interactive_service_flow(
     // Step 3: check balance on service's chain.
     let balance_resp: Value = api
         .get(
-            &format!("/v1/x402/balance?chain_id={chain_id}"),
+            &format!("/api/x402/balance?chain_id={chain_id}"),
             Some(token),
         )
         .await
@@ -123,7 +123,7 @@ pub async fn interactive_service_flow(
     });
 
     // We want the raw response body, so bypass the typed parse path.
-    let pay_url = format!("{}/v1/x402/pay", config::api_url());
+    let pay_url = format!("{}/api/x402/pay", config::api_url());
     let client = reqwest::Client::new();
     let resp = client
         .post(&pay_url)
@@ -131,7 +131,7 @@ pub async fn interactive_service_flow(
         .json(&pay_body)
         .send()
         .await
-        .context("POST /v1/x402/pay failed")?;
+        .context("POST /api/x402/pay failed")?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -147,6 +147,7 @@ pub async fn interactive_service_flow(
 /// Pre-payment confirmation for `facto pay`.
 ///
 /// Returns `true` if the caller should proceed with payment, `false` if cancelled.
+#[allow(clippy::too_many_arguments)]
 pub async fn confirm_before_pay(
     api: &FactoApi,
     token: &str,
@@ -199,20 +200,18 @@ pub async fn confirm_before_pay(
                 protocol_label,
             )
             .await?;
+        } else if prompt_yn(&format!("Fund via {protocol_label}? [Y/n]"))? {
+            fund_from_pipeline(
+                api,
+                token,
+                default_pipeline_id,
+                max_amount,
+                true,
+                protocol_label,
+            )
+            .await?;
         } else {
-            if prompt_yn(&format!("Fund via {protocol_label}? [Y/n]"))? {
-                fund_from_pipeline(
-                    api,
-                    token,
-                    default_pipeline_id,
-                    max_amount,
-                    true,
-                    protocol_label,
-                )
-                .await?;
-            } else {
-                return Ok(false);
-            }
+            return Ok(false);
         }
     }
 
@@ -254,7 +253,7 @@ async fn search_services(query: Option<&str>, category: Option<&str>) -> Result<
     if let Some(c) = category {
         qs.push_str(&format!("&category={}", urlencoding::encode(c)));
     }
-    let url = format!("{base}/v1/x402/discovery?{qs}");
+    let url = format!("{base}/api/x402/discovery?{qs}");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -481,7 +480,7 @@ async fn select_funding_pipeline(
 ) -> Result<String> {
     if let Some(id) = preferred_id {
         // Verify it exists.
-        let route: Result<Value> = api.get(&format!("/v1/routes/{id}"), Some(token)).await;
+        let route: Result<Value> = api.get(&format!("/api/routes/{id}"), Some(token)).await;
         if let Ok(r) = route {
             if r["status"].as_str() == Some("active") {
                 let name = r["name"].as_str().unwrap_or(id);
@@ -496,7 +495,7 @@ async fn select_funding_pipeline(
 
     // Fetch all active pipelines.
     let routes: Vec<Value> = api
-        .get("/v1/routes/me", Some(token))
+        .get("/api/routes/me", Some(token))
         .await
         .context("Failed to fetch pipelines")?;
 
@@ -558,7 +557,7 @@ async fn try_fund(
     protocol_label: &str,
 ) -> Result<()> {
     let route: Value = api
-        .get(&format!("/v1/routes/{pipeline_id}"), Some(token))
+        .get(&format!("/api/routes/{pipeline_id}"), Some(token))
         .await
         .context("Failed to fetch pipeline details")?;
 
@@ -583,7 +582,7 @@ async fn try_fund(
         });
 
         let _: Value = api
-            .post_authenticated("/v1/mpp/fund", &payload, token)
+            .post_authenticated("/api/mpp/fund", &payload, token)
             .await
             .context("Funding failed")?;
 
@@ -594,7 +593,7 @@ async fn try_fund(
     }
 
     let me: Value = api
-        .get("/v1/auth/me", Some(token))
+        .get("/api/auth/me", Some(token))
         .await
         .context("Failed to fetch user info")?;
 
@@ -624,7 +623,7 @@ async fn try_fund(
     )?;
 
     let _: Value = api
-        .post_authenticated("/v1/charges/execute-7702", &payload, token)
+        .post_authenticated("/api/charges/execute-7702", &payload, token)
         .await
         .context("Funding failed")?;
 
@@ -636,7 +635,7 @@ async fn try_fund(
 
 async fn ensure_recipient_allowlisted(api: &FactoApi, token: &str, recipient: &str) -> Result<()> {
     let allowlist: Vec<Value> = api
-        .get("/v1/recipients", Some(token))
+        .get("/api/recipients", Some(token))
         .await
         .context("Failed to fetch recipient allowlist")?;
 
@@ -657,7 +656,7 @@ async fn ensure_recipient_allowlisted(api: &FactoApi, token: &str, recipient: &s
     });
 
     let _: Value = api
-        .post_authenticated("/v1/recipients", &add_body, token)
+        .post_authenticated("/api/recipients", &add_body, token)
         .await
         .context("Failed to add payment wallet to recipient allowlist")?;
 
@@ -729,9 +728,9 @@ fn uses_mpp_funding(protocol_label: &str) -> bool {
 
 fn payment_balance_path(protocol_label: &str, chain_id: u64) -> String {
     if uses_mpp_funding(protocol_label) {
-        format!("/v1/mpp/balance?chain_id={chain_id}")
+        format!("/api/mpp/balance?chain_id={chain_id}")
     } else {
-        format!("/v1/x402/balance?chain_id={chain_id}")
+        format!("/api/x402/balance?chain_id={chain_id}")
     }
 }
 
@@ -832,11 +831,11 @@ mod tests {
         assert!(uses_mpp_funding("mpp"));
         assert_eq!(
             payment_balance_path("mpp", 143),
-            "/v1/mpp/balance?chain_id=143"
+            "/api/mpp/balance?chain_id=143"
         );
         assert_eq!(
             payment_balance_path("x402", 8453),
-            "/v1/x402/balance?chain_id=8453"
+            "/api/x402/balance?chain_id=8453"
         );
     }
 }

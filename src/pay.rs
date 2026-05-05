@@ -83,7 +83,7 @@ pub async fn resolve_payment(
     token: &str,
     request: &PayResolveRequest,
 ) -> Result<PayResolveResponse> {
-    api.post_authenticated("/v1/pay/resolve", request, token)
+    api.post_authenticated("/api/pay/resolve", request, token)
         .await
 }
 
@@ -138,8 +138,8 @@ pub fn temporary_pipeline_notice(
 
 pub fn payment_endpoint(protocol: &str) -> Option<&'static str> {
     match protocol {
-        "x402" => Some("/v1/x402/pay"),
-        "mpp" => Some("/v1/mpp/pay"),
+        "x402" => Some("/api/x402/pay"),
+        "mpp" => Some("/api/mpp/pay"),
         _ => None,
     }
 }
@@ -173,8 +173,8 @@ mod tests {
 
     #[test]
     fn maps_payment_endpoints_by_protocol() {
-        assert_eq!(payment_endpoint("x402"), Some("/v1/x402/pay"));
-        assert_eq!(payment_endpoint("mpp"), Some("/v1/mpp/pay"));
+        assert_eq!(payment_endpoint("x402"), Some("/api/x402/pay"));
+        assert_eq!(payment_endpoint("mpp"), Some("/api/mpp/pay"));
         assert_eq!(payment_endpoint("none"), None);
     }
 

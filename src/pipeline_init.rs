@@ -34,7 +34,7 @@ struct SetDefaultPipeline {
     default_pipeline_id: String,
 }
 
-// A generic wrapper used for PUT /v1/user/preferences which returns an object
+// A generic wrapper used for PUT /api/user/preferences which returns an object
 // we don't need to inspect.
 #[derive(Debug, Deserialize)]
 struct AckResponse {}
@@ -64,7 +64,7 @@ fn frontend_cache_is_fresh(cached_at: &chrono::DateTime<chrono::Utc>) -> bool {
 
 /// Fetch a single route by ID; returns `None` if not found (404).
 async fn fetch_route(api: &FactoApi, token: &str, route_id: &str) -> Result<Option<RouteResponse>> {
-    let path = format!("/v1/routes/{route_id}");
+    let path = format!("/api/routes/{route_id}");
     let result: Result<RouteResponse> = api.get(&path, Some(token)).await;
     match result {
         Ok(r) => Ok(Some(r)),
@@ -86,12 +86,12 @@ fn is_valid_base_route(r: &RouteResponse) -> bool {
 
 /// Fetch user preferences from the backend.
 async fn fetch_preferences(api: &FactoApi, token: &str) -> Result<UserPreferences> {
-    api.get("/v1/user/preferences", Some(token)).await
+    api.get("/api/user/preferences", Some(token)).await
 }
 
 /// Fetch all routes belonging to the current user.
 async fn fetch_my_routes(api: &FactoApi, token: &str) -> Result<Vec<RouteResponse>> {
-    api.get("/v1/routes/me", Some(token)).await
+    api.get("/api/routes/me", Some(token)).await
 }
 
 /// Persist the chosen pipeline ID as the default on the backend and in local cache.
@@ -100,7 +100,7 @@ async fn set_default(api: &FactoApi, token: &str, pipeline_id: &str) -> Result<(
         default_pipeline_id: pipeline_id.to_string(),
     };
     let _: AckResponse = api
-        .put_authenticated("/v1/user/preferences", &body, token)
+        .put_authenticated("/api/user/preferences", &body, token)
         .await
         .context("Failed to set default pipeline on backend")?;
 
@@ -226,7 +226,7 @@ pub fn cache_cli_meta(meta: &CliMeta) -> Result<()> {
 
 async fn fetch_cli_meta(api: &FactoApi) -> Result<CliMeta> {
     let meta: CliMeta = api
-        .get("/v1/cli/meta", None)
+        .get("/cli/meta", None)
         .await
         .context("Failed to fetch CLI browser surfaces")?;
     let frontend_url = normalize_frontend_url(&meta.frontend_url);
