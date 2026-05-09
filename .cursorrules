@@ -1,0 +1,5 @@
+Read AGENTS.md at the repo root before any task. AGENTS.md is the single source of truth for project rules and contributor onboarding.
+
+For first-day setup, run `bash scripts/dev/init.sh`. Project constraints live in `../facto-engine/docs/harness/PROJECT_CONSTRAINTS.md`.
+
+Cursor 0.50+ also auto-discovers AGENTS.md, so this file is a safety net. If a rule conflicts between files, AGENTS.md wins.

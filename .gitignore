@@ -1,6 +1,8 @@
 /target/
 .DS_Store
 .env*
+# .env.example IS tracked — contributor onboarding template.
+!.env.example
 .vscode/
 .idea/
 docs/superpowers/
