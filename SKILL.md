@@ -93,3 +93,31 @@ facto -t pipelines
 - The selected default pipeline stays unchanged even if `facto pay` temporarily uses another compatible execution pipeline
 - If fund fails with "insufficient balance", report the pipeline balance to the user
 - All amounts in human-readable USDC (e.g., "10", "0.50")
+
+## Shop demo setup (separate from Consumer payments)
+
+Use the existing CLI for an offline setup plan or a read-only public
+configuration check:
+
+```bash
+facto demo plan --demo shop --target test --mode fresh
+facto -t demo plan --demo shop --target dev --mode reuse
+facto demo check --demo shop --target test --mode fresh --demo-url https://shop.example
+```
+
+Replace the example with the running Shop HTTPS origin. Explicit target and
+fresh/reuse mode are required. The commands bypass Consumer configuration,
+credentials and startup updates even without -t.
+
+- Fresh: the Owner and a second Developer must complete their own existing
+  Partner email/MFA/invitation steps. The plan does not do or verify this.
+- Reuse: recheck current membership/App scope; recover the original pending
+  operation before considering another write.
+- Check sends only GET /api/facto/config, with no Cookie/Authorization and no
+  redirects. Only its validated public configuration whitelist is emitted.
+- Keep the fixed Shop beta.5 SDK and target-specific server credentials.
+  Do not copy Consumer, Test or Dev credentials across identities/targets.
+- Do not infer authenticated access or UAT from either command. The output
+  retains authentication_verified=false, installation_verified=false and
+  uat_status=NOT_RUN. Never use this setup command to start payment/funding.
+- No Partner device authorization or other Demo adapters are provided yet.

@@ -256,3 +256,71 @@ If you discover a security vulnerability, please report it responsibly. See [SEC
 ## License
 
 [MIT](LICENSE)
+
+## Shop demo setup and public configuration
+
+The experimental Shop setup commands use explicit deployment targets and do not
+use the Consumer login, credentials, active environment, or startup update check.
+They do not create organizations, invite members, issue credentials, authenticate,
+start a server, change configuration, pay, or fund anything.
+
+Prepare an offline plan for a new organization and second Developer:
+
+```bash
+facto demo plan --demo shop --target test --mode fresh
+facto -t demo plan --demo shop --target dev --mode reuse
+```
+
+Fresh means the intended journey starts with a new real identity/organization
+and a second, independently authenticated Developer. Reuse means the operator
+uses an existing setup after checking current membership and App permissions.
+The command does not perform or confirm either journey. Complete the existing
+Partner browser flow for the selected target, including email verification, MFA,
+the directed invitation and explicit application/server configuration.
+
+The plan identifies Shop candidate source
+`9e44a08d04845f6db1d108f58629374ddbd331ab` and the fixed
+`@facto-to/connect@0.0.1-beta.5` artifact. These are expected
+inputs, not proof of the installed or served version. Use that Shop checkout's
+committed lockfile and vendored artifact, then its existing target command after
+providing the authorized server configuration and an owned application database:
+
+```bash
+# From the fixed Shop checkout, with its documented server-only configuration:
+npm ci
+npm run dev:facto-test
+# Use npm run dev:facto-dev for the independent Dev deployment instead.
+```
+
+The client secret stays in the Shop backend. Do not copy a Test credential,
+session, App or pending operation into Dev, or a Consumer token into Partner.
+Do not replay a write whose result is unknown; read the original operation in
+the existing authorized interface.
+
+Read only the public configuration of an already running Shop instance:
+
+```bash
+facto demo check --demo shop --target test --mode fresh --demo-url https://shop.example
+facto -t demo check --demo shop --target dev --mode reuse --demo-url https://shop.example
+```
+
+Replace the example origin with your own running Shop origin. Only HTTPS origins
+are accepted: no userinfo, path, query or fragment. The command sends one GET to
+`/api/facto/config` without cookies or Authorization and does not
+follow redirects. Responses are bounded and must contain only the existing
+public fields: App ID, environment name/API/Hosted origins, and clientConfigured.
+Missing or additional fields, wrong targets and incomplete client configuration
+fail with a safe named error; raw bodies and secrets are not printed.
+
+Test expects test-api.facto.to/test.facto.to; Dev expects
+dev-api.facto.to/dev.facto.to (Dev's Sandbox display alias is accepted).
+Both consume the existing SDK wire environment; the command adds no SDK enum.
+
+JSON is available with -t; normal output and help are English. Successful plan
+or check exits 0, runtime check failures exit nonzero, and malformed arguments
+use Clap's nonzero parser exit. A successful check means configuration only:
+`authentication_verified=false`, `installation_verified=false`,
+and `uat_status=NOT_RUN` remain explicit. It does not prove
+permissions, SDK connectivity, callback delivery, consent, payments, deployed
+versions or business UAT. Partner device authorization and Lumina/Orbit/Meridian
+adapters are not implemented by this slice.

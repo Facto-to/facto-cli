@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod demo;
 mod interactive;
 mod pay;
 mod pipeline_init;
@@ -62,6 +63,12 @@ enum PipelineAction {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Plan Shop onboarding or check only its public configuration.
+    Demo {
+        #[command(subcommand)]
+        action: demo::Command,
+    },
+
     /// Authenticate the operator via browser (Privy OAuth) or dev token.
     Login {
         /// Reserved for future CI/server support. Not supported for CLI user commands yet.
@@ -191,6 +198,11 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Demo setup is independent of Consumer state and all startup side effects.
+    if let Commands::Demo { action } = &cli.command {
+        return demo::run(action, cli.terse).await;
+    }
+
     // Startup update check: only in interactive (TTY) non-terse mode,
     // skip for upgrade command itself, throttled to every 4 hours.
     if !cli.terse
@@ -208,6 +220,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Demo { action } => demo::run(&action, cli.terse).await,
         Commands::Login {
             api_key,
             signing_key,
