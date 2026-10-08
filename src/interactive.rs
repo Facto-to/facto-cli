@@ -147,18 +147,32 @@ pub async fn interactive_service_flow(
 /// Pre-payment confirmation for `facto pay`.
 ///
 /// Returns `true` if the caller should proceed with payment, `false` if cancelled.
-pub async fn confirm_before_pay(
-    api: &FactoApi,
-    token: &str,
-    url: &str,
-    max_amount: u64,
-    default_pipeline_id: Option<&str>,
-    terse: bool,
-    chain_id: u64,
-    protocol_label: &str,
-    auto_fund: bool,
-    prompt_payment: bool,
-) -> Result<bool> {
+pub(super) struct PaymentConfirmation<'a> {
+    pub(super) api: &'a FactoApi,
+    pub(super) token: &'a str,
+    pub(super) url: &'a str,
+    pub(super) max_amount: u64,
+    pub(super) default_pipeline_id: Option<&'a str>,
+    pub(super) terse: bool,
+    pub(super) chain_id: u64,
+    pub(super) protocol_label: &'a str,
+    pub(super) auto_fund: bool,
+    pub(super) prompt_payment: bool,
+}
+
+pub(super) async fn confirm_before_pay(context: PaymentConfirmation<'_>) -> Result<bool> {
+    let PaymentConfirmation {
+        api,
+        token,
+        url,
+        max_amount,
+        default_pipeline_id,
+        terse,
+        chain_id,
+        protocol_label,
+        auto_fund,
+        prompt_payment,
+    } = context;
     // Check balance on the target chain.
     let balance_path = payment_balance_path(protocol_label, chain_id);
     let balance_resp: Value = api
@@ -199,20 +213,18 @@ pub async fn confirm_before_pay(
                 protocol_label,
             )
             .await?;
+        } else if prompt_yn(&format!("Fund via {protocol_label}? [Y/n]"))? {
+            fund_from_pipeline(
+                api,
+                token,
+                default_pipeline_id,
+                max_amount,
+                true,
+                protocol_label,
+            )
+            .await?;
         } else {
-            if prompt_yn(&format!("Fund via {protocol_label}? [Y/n]"))? {
-                fund_from_pipeline(
-                    api,
-                    token,
-                    default_pipeline_id,
-                    max_amount,
-                    true,
-                    protocol_label,
-                )
-                .await?;
-            } else {
-                return Ok(false);
-            }
+            return Ok(false);
         }
     }
 
