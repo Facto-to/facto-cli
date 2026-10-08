@@ -1937,18 +1937,18 @@ async fn cmd_pay(
     let supports_prefund = resolve.protocol == "x402"
         || (resolve.protocol == "mpp" && resolve.can_auto_fund.unwrap_or(false));
     let confirmed = if supports_prefund {
-        interactive::confirm_before_pay(
-            &api,
-            &creds.token,
+        interactive::confirm_before_pay(interactive::PaymentConfirmation {
+            api: &api,
+            token: &creds.token,
             url,
-            quoted_amount,
-            Some(execution_pipeline_id.as_str()),
+            max_amount: quoted_amount,
+            default_pipeline_id: Some(execution_pipeline_id.as_str()),
             terse,
             chain_id,
-            &resolve.protocol,
-            yes || terse,
-            !yes && !terse,
-        )
+            protocol_label: &resolve.protocol,
+            auto_fund: yes || terse,
+            prompt_payment: !yes && !terse,
+        })
         .await?
     } else if yes || terse {
         true
@@ -1975,18 +1975,18 @@ async fn cmd_pay(
     let chain_id = resolved_chain_id.unwrap_or(8453);
     let max_amount_atomic = max_amount_atomic.or_else(|| resolve.quoted_amount.clone());
     let protocol_name = resolve.protocol.clone();
-    let body = build_payment_request_body(
+    let body = build_payment_request_body(PaymentRequestBody {
         url,
         method,
         header_map,
         parsed_data,
         chain_id,
-        max_amount_atomic.clone(),
-        protocol_name.clone(),
-        resolve.payment_method.clone(),
-        selected_pipeline_id.clone(),
-        Some(execution_pipeline_id.clone()),
-    );
+        max_amount_atomic: max_amount_atomic.clone(),
+        protocol_name: protocol_name.clone(),
+        payment_method: resolve.payment_method.clone(),
+        selected_pipeline_id: selected_pipeline_id.clone(),
+        execution_pipeline_id: Some(execution_pipeline_id.clone()),
+    });
 
     let endpoint = pay::payment_endpoint(protocol_name.as_str()).unwrap_or("/v1/x402/pay");
     let resp: serde_json::Value = api
@@ -2006,9 +2006,9 @@ async fn cmd_pay(
     Ok(())
 }
 
-fn build_payment_request_body(
-    url: &str,
-    method: &str,
+struct PaymentRequestBody<'a> {
+    url: &'a str,
+    method: &'a str,
     header_map: std::collections::HashMap<String, String>,
     parsed_data: Option<serde_json::Value>,
     chain_id: u64,
@@ -2017,7 +2017,21 @@ fn build_payment_request_body(
     payment_method: Option<String>,
     selected_pipeline_id: Option<String>,
     execution_pipeline_id: Option<String>,
-) -> serde_json::Value {
+}
+
+fn build_payment_request_body(context: PaymentRequestBody<'_>) -> serde_json::Value {
+    let PaymentRequestBody {
+        url,
+        method,
+        header_map,
+        parsed_data,
+        chain_id,
+        max_amount_atomic,
+        protocol_name,
+        payment_method,
+        selected_pipeline_id,
+        execution_pipeline_id,
+    } = context;
     serde_json::json!({
         "url": url,
         "method": method.to_uppercase(),
@@ -2739,18 +2753,18 @@ mod tests {
 
     #[test]
     fn test_build_payment_request_body_uses_camel_case_fields() {
-        let body = build_payment_request_body(
-            "https://example.com/pay",
-            "post",
-            HashMap::from([("x-test".to_string(), "1".to_string())]),
-            Some(serde_json::json!({"hello":"world"})),
-            143,
-            Some("1000000".to_string()),
-            "mpp".to_string(),
-            Some("monad".to_string()),
-            Some("route-base".to_string()),
-            Some("route-monad".to_string()),
-        );
+        let body = build_payment_request_body(PaymentRequestBody {
+            url: "https://example.com/pay",
+            method: "post",
+            header_map: HashMap::from([("x-test".to_string(), "1".to_string())]),
+            parsed_data: Some(serde_json::json!({"hello":"world"})),
+            chain_id: 143,
+            max_amount_atomic: Some("1000000".to_string()),
+            protocol_name: "mpp".to_string(),
+            payment_method: Some("monad".to_string()),
+            selected_pipeline_id: Some("route-base".to_string()),
+            execution_pipeline_id: Some("route-monad".to_string()),
+        });
 
         assert_eq!(body.get("chainId").and_then(|v| v.as_u64()), Some(143));
         assert_eq!(
