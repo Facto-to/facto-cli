@@ -355,7 +355,7 @@ impl Journal {
             .and_then(serde_json::Value::as_str)
             .ok_or(StateError::JournalInvalid)?;
         if !is_lower_hex(hash, 64)
-            || hash != &verification_code_hash(&self.authorization_id, &self.pairing_code)
+            || hash != verification_code_hash(&self.authorization_id, &self.pairing_code)
         {
             return Err(StateError::JournalInvalid);
         }
@@ -500,7 +500,7 @@ pub(crate) fn ensure_store(dir: &Path) -> Result<(), StateError> {
     let partner_cli = dir.parent().ok_or(StateError::InsecureStore)?;
     let facto = partner_cli.parent().ok_or(StateError::InsecureStore)?;
     for ancestor in [facto, partner_cli, dir] {
-        if is_symlink(&ancestor) {
+        if is_symlink(ancestor) {
             return Err(StateError::InsecureStore);
         }
     }
@@ -1221,6 +1221,9 @@ mod tests {
         older.revoke_recorded = true;
         older.revoke_request_id = Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc".into());
         older.revoke_expected_revision = Some(1);
+        // A recorded phase must carry the deadline it originally ran to, so the
+        // pairing is describable and the store stays unoccupied.
+        older.expires_at = (now() + chrono::Duration::minutes(10)).to_rfc3339();
         older.created_at = now().to_rfc3339();
         older.updated_at = Utc
             .with_ymd_and_hms(2026, 10, 13, 1, 0, 0)
@@ -1232,6 +1235,7 @@ mod tests {
             .with_ymd_and_hms(2026, 10, 13, 2, 0, 0)
             .unwrap()
             .to_rfc3339();
+        older.validate().expect("valid resolved older");
         create(&dir, &older).expect("older");
         create(&dir, &newer).expect("newer");
         assert_eq!(

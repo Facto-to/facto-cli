@@ -150,6 +150,7 @@ fn display_pairing_code(normalized: &str) -> String {
 fn normalize_pairing_code(input: &str) -> Option<String> {
     state::normalize_pairing_code(input)
 }
+#[cfg(test)]
 fn matching_canonical_bytes(authorization_id: &str, normalized: &str) -> Vec<u8> {
     state::matching_canonical_bytes(authorization_id, normalized)
 }
@@ -712,6 +713,7 @@ fn request_for(client: &Client, origin: &str, built: &Built) -> Result<Request, 
         .map_err(|_| Failure::Local("transport_unavailable"))
 }
 
+#[cfg(test)]
 fn live_request(built: &Built) -> Result<(Client, Request), Failure> {
     let client = live_client()?;
     let request = request_for(&client, API_ORIGIN, built)?;
@@ -1817,6 +1819,7 @@ async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Resu
     }
     Ok(())
 }
+#[cfg(test)]
 fn receipt_key(journal: &Journal, operation: &str) -> Result<String, Failure> {
     let key = match operation {
         "create" => Some(journal.create_request_id.clone()),
