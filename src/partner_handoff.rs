@@ -810,11 +810,6 @@ impl Stub {
             .push_back((200, vec![serde_json::to_vec(value).expect("bytes")]));
     }
 
-    fn created(&mut self, value: &serde_json::Value) {
-        self.script
-            .push_back((201, vec![serde_json::to_vec(value).expect("bytes")]));
-    }
-
     fn status(&mut self, code: u16, value: &serde_json::Value) {
         self.script
             .push_back((code, vec![serde_json::to_vec(value).expect("bytes")]));
