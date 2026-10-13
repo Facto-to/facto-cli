@@ -91,6 +91,8 @@ fn assert_no_credential_material(output: &Output) -> String {
                 .all(|(offset, c)| offset == 5 || (c.is_ascii_uppercase() && !"IO01".contains(*c)));
         assert!(!shape, "a pairing code shape leaked");
     }
+    // The capture that was just inspected is what the endpoint check inspects.
+    text
 }
 
 #[test]
