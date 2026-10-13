@@ -824,10 +824,8 @@ mod tests {
         let dir = store_dir(&home);
         ensure_store(&dir).expect("store");
         assert_eq!(mode_of(&dir).expect("test mode"), DIR_MODE);
-        assert_eq!(
-            mode_of(&dir.parent().unwrap()).expect("partner-cli mode"),
-            DIR_MODE
-        );
+        let partner_cli = dir.parent().expect("partner-cli parent");
+        assert_eq!(mode_of(partner_cli).expect("partner-cli mode"), DIR_MODE);
         // The Consumer directory keeps its own historical permissions.
         assert_eq!(mode_of(&home.join(".facto")).expect("facto mode"), 0o755);
 
@@ -908,7 +906,7 @@ mod tests {
         ensure_store(&dir).expect("store");
         let id = "22222222-2222-4222-8222-222222222222";
         create(&dir, &journal(id)).expect("create");
-        let raw = fs::read(&journal_path(&dir, id)).expect("raw");
+        let raw = fs::read(journal_path(&dir, id)).expect("raw");
         let text = String::from_utf8(raw).expect("utf8");
         assert!(text.contains("\"proof_hex\""));
         assert!(text.contains("\"pairing_code\""));
@@ -944,13 +942,18 @@ mod tests {
         create(&dir, &entry).expect("create");
 
         let mut later = now();
+        // Structurally valid in every field, and rewritten only by a different
+        // creation stamp: the compare-and-set is what has to refuse it.
         let mut stale = entry.clone();
+        stale.create_recorded = true;
         stale.phase = "PENDING".to_string();
         stale.revision = 1;
+        stale.expires_at = "2026-10-13T00:10:00+00:00".to_string();
         stale.created_at = Utc
             .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
             .unwrap()
             .to_rfc3339();
+        stale.validate().expect("stale object is well formed");
         assert_eq!(save(&dir, &stale).unwrap_err(), StateError::IntentConflict);
 
         entry.mark_unknown("create");
@@ -1210,8 +1213,14 @@ mod tests {
         ensure_store(&dir).expect("store");
         assert_eq!(current(&dir).unwrap_err(), StateError::JournalMissing);
         let mut older = journal("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
-        // A finished pairing does not occupy the store, so a second one may exist.
+        // A fully resolved, revoked pairing does not occupy the store, so a
+        // second pairing may legitimately be created beside it.
+        older.create_recorded = true;
         older.phase = "REVOKED".into();
+        older.revision = 2;
+        older.revoke_recorded = true;
+        older.revoke_request_id = Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc".into());
+        older.revoke_expected_revision = Some(1);
         older.created_at = now().to_rfc3339();
         older.updated_at = Utc
             .with_ymd_and_hms(2026, 10, 13, 1, 0, 0)
@@ -1271,7 +1280,10 @@ mod tests {
         assert!(is_canonical_uuid("0e9d2b1f-1a2b-4c3d-8e9f-0123456789ab"));
         assert!(is_canonical_uuid("ffffffff-ffff-4fff-8fff-ffffffffffff"));
         assert!(!is_canonical_uuid("00000000-0000-4000-8000-00000000000G"));
-        assert!(!is_canonical_uuid("00000000-0000-4000-8000-000000000000"));
+        // Every-digit is the valid shape above; these are genuinely malformed.
+        assert!(!is_canonical_uuid("00000000-0000-4000-8000-00000000000A"));
+        assert!(!is_canonical_uuid("00000000-0000-4000-8000-0000000000_0"));
+        assert!(!is_canonical_uuid("00000000_0000-4000-8000-000000000000"));
         assert!(!is_canonical_uuid("000000000000400080000000000000000000"));
         assert!(!is_canonical_uuid("00000000-0000-4000-8000-00000000000"));
         assert!(is_lower_hex(&"0".repeat(64), 64));

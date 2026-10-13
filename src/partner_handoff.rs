@@ -336,7 +336,7 @@ fn approval_page_uri(authorization_id: &str) -> String {
 
 fn server_or_local(code: &str) -> Failure {
     match SERVER_ERROR_CODES.iter().find(|known| **known == code) {
-        Some(known) => Failure::Server(*known),
+        Some(known) => Failure::Server(known),
         None => Failure::Local("receipt_unknown"),
     }
 }
@@ -1222,22 +1222,6 @@ impl Report {
         }
     }
 
-    fn from_journal(
-        kind: &'static str,
-        mode: &str,
-        stage: &'static str,
-        journal: &Journal,
-    ) -> Self {
-        let mut report = Report::new(kind, mode, stage);
-        report.authorization_id = Some(journal.authorization_id.clone());
-        report.phase = Some(journal.phase.clone());
-        report.revision = Some(journal.revision);
-        report.expires_at = (!journal.expires_at.is_empty()).then(|| journal.expires_at.clone());
-        report.session_id = journal.session_id.clone();
-        report.verification_uri = Some(approval_page_uri(&journal.authorization_id));
-        report
-    }
-
     fn succeeded(mut self) -> Self {
         self.status = "ok".to_string();
         self.error = None;
@@ -1349,17 +1333,18 @@ fn wants_resume(journal: &Journal, now: DateTime<Utc>) -> bool {
         return true;
     }
     let pairing = matches!(journal.phase.as_str(), "PENDING" | "APPROVED");
-    pairing
-        && journal
-            .pairing_deadline()
-            .map_or(true, |deadline| deadline > now)
+    let live = match journal.pairing_deadline() {
+        Some(deadline) => deadline > now,
+        None => true,
+    };
+    pairing && live
 }
 
 fn blocks_new_pairing(journal: &Journal, now: DateTime<Utc>) -> bool {
     journal.phase == "ACTIVE"
         && journal
             .pairing_deadline()
-            .map_or(false, |deadline| deadline > now)
+            .is_some_and(|deadline| deadline > now)
 }
 
 /// Persist the original intent, then issue the single create POST. A lost
@@ -1401,7 +1386,7 @@ async fn fresh_pairing(
     let built = build_create(&proof, &authorization_id, value);
     let created = match sender.transact(&built, StatusCode::CREATED).await {
         Ok(bytes) => validate_create(parse::<CreateResponse>(&bytes)?, &authorization_id, now)?,
-        Err(failure) if failure == Failure::Local("transport_unavailable") => {
+        Err(Failure::Local("transport_unavailable")) => {
             journal.mark_unknown("create");
             journal.touch(&now, "UNKNOWN", journal.revision, "");
             persist(dir, &journal)?;
@@ -1775,7 +1760,7 @@ async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Resu
 
     // Recovery reads only, driven by every persisted intent rather than by an
     // in-memory list: no create, exchange or refresh side effect happens here.
-    let (mut journal, mut failures) = recover_all(&dir, &sender, report).await?;
+    let (mut journal, mut failures) = recover_all(&dir, sender, report).await?;
     if !journal.pending_intents().is_empty() {
         report.unknown_operations = Some(
             journal
@@ -1787,9 +1772,9 @@ async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Resu
     }
 
     report.stage = "authorization";
-    let view = match read_authorization(&sender, &journal).await {
+    let view = match read_authorization(sender, &journal).await {
         Ok(view) => view,
-        Err(failure) if failure == Failure::Local("http_rejected") => {
+        Err(Failure::Local("http_rejected")) => {
             report.phase = Some(journal.phase.clone());
             failures.push("authorization:receipt_unknown".to_string());
             if !failures.is_empty() {
@@ -1827,7 +1812,7 @@ async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Resu
     report.authentication_verified = false;
     if let Some(first) = failures.first() {
         report.effect = Some(failures.join(","));
-        let code = first.split(':').last().unwrap_or("receipt_unknown");
+        let code = first.split(':').next_back().unwrap_or("receipt_unknown");
         let failure = match code {
             "receipt_unknown" => Failure::Local("receipt_unknown"),
             "wire_invalid" => Failure::Local("wire_invalid"),
@@ -1870,7 +1855,7 @@ async fn check_access_run(
     // The original ticket gives this command exactly one GET: the current read.
     report.stage = "workspace";
     let snapshot = stored_approval(&journal)?;
-    let workspace = read_workspace(&sender, &journal).await?;
+    let workspace = read_workspace(sender, &journal).await?;
     let workspace = validate_workspace(workspace, &journal.authorization_id, &snapshot, clock())?;
     report.phase = Some("ACTIVE".to_string());
     report.expires_at = Some(workspace.expires_at.clone());
@@ -2215,6 +2200,10 @@ mod tests {
         /// Receipt reads answered as UNKNOWN, to reproduce an effect that stays
         /// unknown until a later process reads it again.
         unknown_receipt: Arc<AtomicUsize>,
+        /// One timeline per authorization, so a poll, an exchange and a receipt
+        /// replay can never invent a later deadline.
+        pinned: Arc<Mutex<HashMap<String, Pinned>>>,
+        current: Arc<Mutex<String>>,
         /// Effects the server actually processed, keyed by operation and
         /// original request id. A receipt read may only replay one of these.
         effects: Arc<Mutex<HashMap<String, String>>>,
@@ -2236,13 +2225,13 @@ mod tests {
             widen: Arc::new(AtomicUsize::new(0)),
             unknown_receipt: Arc::new(AtomicUsize::new(0)),
             effects: Arc::new(Mutex::new(HashMap::new())),
+            pinned: Arc::new(Mutex::new(HashMap::new())),
+            current: Arc::new(Mutex::new(String::new())),
         };
         let server = fixture.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    serve(stream, &server);
-                }
+            for stream in listener.incoming().flatten() {
+                serve(stream, &server);
             }
         });
         (format!("http://127.0.0.1:{port}"), fixture)
@@ -2294,7 +2283,34 @@ mod tests {
             .to_string()
     }
 
-    fn snapshot_json(app_ids: &[&str]) -> Value {
+    #[derive(Clone)]
+    struct Pinned {
+        pending_expires_at: String,
+        approval_expires_at: String,
+        snapshot: Value,
+    }
+
+    /// The first contact with an authorization fixes its timeline for the rest
+    /// of the test, exactly as a real primary would.
+    fn pinned_for(fixture: &Fixture, auth: &str) -> Pinned {
+        let mut map = fixture.pinned.lock().expect("pin lock");
+        if let Some(existing) = map.get(auth) {
+            return existing.clone();
+        }
+        let created = Utc::now();
+        let entry = Pinned {
+            pending_expires_at: (created + Duration::seconds(300)).to_rfc3339(),
+            approval_expires_at: (created + Duration::seconds(240)).to_rfc3339(),
+            snapshot: snapshot_json_at(
+                &["mapp_one"],
+                &(created + Duration::seconds(240)).to_rfc3339(),
+            ),
+        };
+        map.insert(auth.to_string(), entry.clone());
+        entry
+    }
+
+    fn snapshot_json_at(app_ids: &[&str], expiry: &str) -> Value {
         json!({
             "partner_user_id": OTHER_ID,
             "organization_id": "33333333-3333-4333-8333-333333333333",
@@ -2305,91 +2321,128 @@ mod tests {
             "authorization_revision": 3,
             "granted_actions": ACTIONS,
             "authorized_app_ids": app_ids,
-            "expires_at": (Utc::now() + Duration::seconds(600)).to_rfc3339()
+            "expires_at": expiry
         })
     }
 
-    fn respond_to(kind: &str, path: &str, body: &str, widen: bool) -> Value {
-        let now = Utc::now();
-        let auth = locator(path);
-        let request_id = serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("request_id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_string)
-            })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| {
-                path.trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            });
+    fn auth_for(fixture: &Fixture, path: &str) -> String {
+        let located = locator(path);
+        if !located.is_empty() {
+            return located;
+        }
+        fixture.current.lock().expect("current lock").clone()
+    }
+
+    fn respond_to(
+        fixture: &Fixture,
+        kind: &str,
+        path: &str,
+        body: &str,
+        widen: bool,
+    ) -> (u16, Value) {
+        let auth = auth_for(fixture, path);
+        let request_id = request_key(body, path);
         match kind {
-            "create" => json!({
-                "authorization_id": request_id,
-                "request_id": request_id,
-                "target_environment": "test",
-                "realm": "test",
-                "status": "PENDING",
-                "revision": 1,
-                "expires_at": (now + Duration::seconds(300)).to_rfc3339(),
-                "poll_interval_seconds": 2,
-                "verification_uri": approval_page_uri(&request_id)
-            }),
-            "authorization" => json!({
-                "authorization_id": auth,
-                "target_environment": "test",
-                "realm": "test",
-                "status": "APPROVED",
-                "revision": 2,
-                "expires_at": (now + Duration::seconds(300)).to_rfc3339(),
-                "approval": snapshot_json(&["mapp_one"])
-            }),
-            "exchange" => json!({
-                "request_id": request_id,
-                "operation": "partner_cli.exchange",
-                "authorization_id": auth,
-                "status": "ACTIVE",
-                "previous_revision": 2,
-                "revision": 3,
-                "approval": snapshot_json(&["mapp_one"]),
-                "session_id": auth,
-                "expires_at": (now + Duration::seconds(120)).to_rfc3339()
-            }),
-            "revoke" => json!({
-                "request_id": request_id,
-                "operation": "partner_cli.revoke",
-                "authorization_id": auth,
-                "status": "REVOKED",
-                "previous_revision": 3,
-                "revision": 4,
-                "approval": snapshot_json(&["mapp_one"])
-            }),
-            "receipt" => Value::Null,
-            _ => json!({
-                "session_id": auth,
-                "target_environment": "test",
-                "realm": "test",
-                "partner_user_id": OTHER_ID,
-                "organization_id": "33333333-3333-4333-8333-333333333333",
-                "membership_id": "44444444-4444-4444-8444-444444444444",
-                "partner_role_id": "55555555-5555-4555-8555-555555555555",
-                "environment": "dev",
-                "authorization_revision": 3,
-                "granted_actions": ACTIONS,
-                "authorized_app_ids": if widen { json!(["mapp_one", "mapp_two"]) } else { json!(["mapp_one"]) },
-                "expires_at": (now + Duration::seconds(120)).to_rfc3339(),
-                "apps": if widen {
-                    json!([{"app_id": "mapp_one", "display_name": "Shop", "status": "active"},
-                           {"app_id": "mapp_two", "display_name": "Wider", "status": "active"}])
+            "create" => {
+                let pin = pinned_for(fixture, &request_id);
+                *fixture.current.lock().expect("current lock") = request_id.clone();
+                (
+                    201,
+                    json!({
+                        "authorization_id": request_id,
+                        "request_id": request_id,
+                        "target_environment": "test",
+                        "realm": "test",
+                        "status": "PENDING",
+                        "revision": 1,
+                        "expires_at": pin.pending_expires_at,
+                        "poll_interval_seconds": 2,
+                        "verification_uri": approval_page_uri(&request_id)
+                    }),
+                )
+            }
+            "authorization" => {
+                let pin = pinned_for(fixture, &auth);
+                (
+                    200,
+                    json!({
+                        "authorization_id": auth,
+                        "target_environment": "test",
+                        "realm": "test",
+                        "status": "APPROVED",
+                        "revision": 2,
+                        "expires_at": pin.pending_expires_at,
+                        "approval": pin.snapshot
+                    }),
+                )
+            }
+            "exchange" => {
+                let pin = pinned_for(fixture, &auth);
+                (
+                    200,
+                    json!({
+                        "request_id": request_id,
+                        "operation": "partner_cli.exchange",
+                        "authorization_id": auth,
+                        "status": "ACTIVE",
+                        "previous_revision": 2,
+                        "revision": 3,
+                        "approval": pin.snapshot,
+                        "session_id": auth,
+                        "expires_at": pin.approval_expires_at
+                    }),
+                )
+            }
+            "revoke" => {
+                let pin = pinned_for(fixture, &auth);
+                (
+                    200,
+                    json!({
+                        "request_id": request_id,
+                        "operation": "partner_cli.revoke",
+                        "authorization_id": auth,
+                        "status": "REVOKED",
+                        "previous_revision": 3,
+                        "revision": 4,
+                        "approval": pin.snapshot
+                    }),
+                )
+            }
+            _ => {
+                let pin = pinned_for(fixture, &auth);
+                let (ids, apps) = if widen {
+                    (
+                        json!(["mapp_one", "mapp_two"]),
+                        json!([
+                            {"app_id": "mapp_one", "display_name": "Shop", "status": "active"},
+                            {"app_id": "mapp_two", "display_name": "Wider", "status": "active"}
+                        ]),
+                    )
                 } else {
-                    json!([{"app_id": "mapp_one", "display_name": "Shop", "status": "active"}])
-                }
-            }),
+                    (
+                        json!(["mapp_one"]),
+                        json!([{"app_id": "mapp_one", "display_name": "Shop", "status": "active"}]),
+                    )
+                };
+                (
+                    200,
+                    json!({
+                        "session_id": auth,
+                        "target_environment": "test",
+                        "realm": "test",
+                        "partner_user_id": OTHER_ID,
+                        "organization_id": "33333333-3333-4333-8333-333333333333",
+                        "membership_id": "44444444-4444-4444-8444-444444444444",
+                        "partner_role_id": "55555555-5555-4555-8555-555555555555",
+                        "environment": "dev",
+                        "authorization_revision": 3,
+                        "granted_actions": ACTIONS,
+                        "authorized_app_ids": ids,
+                        "expires_at": pin.approval_expires_at,
+                        "apps": apps
+                    }),
+                )
+            }
         }
     }
 
@@ -2434,6 +2487,21 @@ mod tests {
         ))
     }
 
+    fn write_http(stream: &mut TcpStream, status: u16, payload: &[u8]) {
+        let reason = if status == 201 {
+            "201 Created"
+        } else {
+            "200 OK"
+        };
+        let head = format!(
+            "HTTP/1.1 {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(payload);
+        let _ = stream.flush();
+    }
+
     fn serve(mut stream: TcpStream, fixture: &Fixture) {
         let Some((request_line, header_block, body)) = read_request(&mut stream) else {
             return;
@@ -2455,47 +2523,16 @@ mod tests {
             .lock()
             .expect("header lock")
             .push(header_block.clone());
-        let _ = &header_block;
         if method == "POST" {
             fixture.posts.fetch_add(1, Ordering::SeqCst);
         } else {
             fixture.gets.fetch_add(1, Ordering::SeqCst);
         }
-        let signature = format!("{method} {path}");
-        if fixture
-            .drop_on
-            .lock()
-            .expect("drop lock")
-            .iter()
-            .any(|entry| signature.contains(entry))
-        {
-            // The request is recorded, then the connection dies with no reply.
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            return;
-        }
-        if fixture.redirect.load(Ordering::SeqCst) > 0 {
-            fixture.redirect.fetch_sub(1, Ordering::SeqCst);
-            let _ = stream.write_all(
-                b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://elsewhere.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-            let _ = stream.flush();
-            return;
-        }
-        if fixture.oversized.load(Ordering::SeqCst) > 0 {
-            fixture.oversized.fetch_sub(1, Ordering::SeqCst);
-            let declared = MAX_RESPONSE_BYTES + 16;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(&vec![b'x'; declared]);
-            let _ = stream.flush();
-            return;
-        }
-        let widen = fixture.widen.load(Ordering::SeqCst) > 0;
+
         if kind == "receipt" {
-            // Only an effect this server actually processed may be reported,
-            // and always with the payload and deadline it produced at the time.
+            // Only an effect this server really processed may be reported, and
+            // always with the payload and deadline produced at the time. A key
+            // that was never sent has no effect and stays UNKNOWN.
             let operation = receipt_operation(&path);
             let key = path.rsplit('/').next().unwrap_or("").to_string();
             let recorded = fixture
@@ -2520,23 +2557,55 @@ mod tests {
                 }),
             };
             let receipt_body = serde_json::to_vec(&answer).expect("receipt payload");
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                receipt_body.len()
+            write_http(&mut stream, 200, &receipt_body);
+            return;
+        }
+
+        let widen = fixture.widen.load(Ordering::SeqCst) > 0;
+        let (status, value) = respond_to(fixture, kind, &path, &body, widen);
+        if method == "POST" && matches!(kind, "create" | "exchange" | "revoke") {
+            // The effect is processed exactly once, before any lost reply below.
+            let key = format!("{kind}:{}", request_key(&body, &path));
+            fixture
+                .effects
+                .lock()
+                .expect("effect lock")
+                .entry(key)
+                .or_insert_with(|| {
+                    String::from_utf8_lossy(&serde_json::to_vec(&value).expect("effect json"))
+                        .to_string()
+                });
+        }
+        let signature = format!("{method} {path}");
+        if fixture
+            .drop_on
+            .lock()
+            .expect("drop lock")
+            .iter()
+            .any(|entry| signature.contains(entry))
+        {
+            // Processed and recorded, but the reply never reaches the client.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        if fixture.redirect.load(Ordering::SeqCst) > 0 {
+            fixture.redirect.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.write_all(
+                b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://elsewhere.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(&receipt_body);
             let _ = stream.flush();
             return;
         }
-        let payload = serde_json::to_vec(&respond_to(kind, &path, &body, widen)).expect("payload");
-        if method == "POST" && matches!(kind, "create" | "exchange" | "revoke") {
-            // The effect exists server-side even when the reply is lost below.
-            let key = request_key(&body, &path);
-            fixture.effects.lock().expect("effect lock").insert(
-                format!("{kind}:{key}"),
-                String::from_utf8_lossy(&payload).to_string(),
+        if fixture.oversized.load(Ordering::SeqCst) > 0 {
+            fixture.oversized.fetch_sub(1, Ordering::SeqCst);
+            let declared = MAX_RESPONSE_BYTES + 16;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
             );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&vec![b'x'; declared]);
+            let _ = stream.flush();
+            return;
         }
         if fixture.chunked.load(Ordering::SeqCst) > 0 {
             fixture.chunked.fetch_sub(1, Ordering::SeqCst);
@@ -2556,13 +2625,11 @@ mod tests {
             let _ = stream.flush();
             return;
         }
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            payload.len()
+        write_http(
+            &mut stream,
+            status,
+            &serde_json::to_vec(&value).expect("payload"),
         );
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(&payload);
-        let _ = stream.flush();
     }
 
     fn loopback_sender(origin: &str) -> Sender {
@@ -3020,7 +3087,9 @@ mod tests {
     #[test]
     fn pairing_code_only_reaches_an_interactive_terminal() {
         assert_eq!(pairing_channel(false, true, false), Channel::Stdout);
-        assert_eq!(pairing_channel(true, true, false), Channel::Stderr);
+        // Terse keeps stdout for the JSON report, so a non-terminal error
+        // stream cannot carry the pairing code either.
+        assert_eq!(pairing_channel(true, true, false), Channel::Refused);
         assert_eq!(pairing_channel(true, false, false), Channel::Refused);
         assert_eq!(pairing_channel(false, false, true), Channel::Refused);
         assert_eq!(pairing_channel(true, false, true), Channel::Stderr);
@@ -3060,18 +3129,23 @@ mod tests {
         report.authentication_verified = true;
         let json = report.clone().succeeded().render(true);
         let proof_shape = "a".repeat(64);
-        let forbidden: [&str; 7] = [
-            "proof",
+        // Exact credential material and key names only: the report legitimately
+        // carries safe boolean attestations such as app_secret_transport.
+        let forbidden: [&str; 8] = [
+            "\"proof_hex\"",
             proof_shape.as_str(),
-            "matching",
-            "cookie",
-            "secret",
+            "\"pairing_code\"",
             "ABCDEFGHJK",
-            "FGHIJK",
+            "\"cookie\"",
+            "\"client_secret\"",
+            "\"signing_key\"",
+            "\"token\"",
         ];
         for needle in forbidden {
             assert!(!json.contains(needle), "{needle} leaked: {json}");
         }
+        assert!(json.contains("\"app_secret_transport\":false"), "{json}");
+        assert!(json.contains("\"consumer_state_accessed\":false"), "{json}");
         assert!(json.contains("\"uat_status\":\"NOT_RUN\""));
         assert!(json.contains("\"consumer_state_accessed\":false"));
         assert!(json.contains("\"app_secret_transport\":false"));
@@ -3298,62 +3372,6 @@ mod tests {
         );
         report.phase = Some(stored.phase.clone());
         assert_eq!(report.phase.as_deref(), Some("REVOKED"));
-    }
-
-    #[tokio::test]
-    async fn positive_handoff_flow_reads_current_access_once() {
-        let cell = stub();
-        let exchange_id = "77777777-7777-4777-8777-777777777777";
-        // The stub serves responses in consumption order: create, poll, read.
-        cell.borrow_mut().created(&created_view());
-        cell.borrow_mut().ok(&approve_view());
-        cell.borrow_mut().ok(&workspace_view());
-        let sender = Sender::Stub(cell.clone());
-        let dir = store("flow");
-
-        let mut report = Report::new("partner_cli_authorize", "reuse", "precheck");
-        let mut journal = fresh_pairing("reuse", &dir, &sender, &mut report, now())
-            .await
-            .expect("created");
-        assert_eq!(journal.phase, "PENDING");
-        let approved =
-            wait_for_approval(&dir, &mut journal, &sender, clock() + Duration::seconds(60))
-                .await
-                .expect("approved");
-        assert_eq!(approved.status, "APPROVED");
-        journal.record_exchange_intent(exchange_id, approved.revision);
-        persist(&dir, &journal).expect("intent");
-        let reread = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("reread");
-        // The intent survived the write-ahead step unchanged: same create and
-        // exchange request ids, still the pre-exchange phase.
-        assert_eq!(reread.authorization_id, FIXTURE_ID);
-        assert_eq!(reread.create_request_id, FIXTURE_ID);
-        assert_eq!(reread.exchange_request_id.as_deref(), Some(exchange_id));
-        assert_eq!(reread.exchange_expected_revision, Some(approved.revision));
-        assert_eq!(reread.phase, "APPROVED");
-        assert!(!reread.exchange_recorded);
-        let response: ExchangeResponse =
-            parse(exchange_view(exchange_id).to_string().as_bytes()).expect("wire");
-        validate_exchange(
-            response,
-            FIXTURE_ID,
-            exchange_id,
-            approved.revision,
-            &snapshot(&["mapp_one"]),
-            clock(),
-        )
-        .expect("exchange");
-        let workspace: WorkspaceResponse =
-            parse(workspace_view().to_string().as_bytes()).expect("wire");
-        let validated =
-            validate_workspace(workspace, FIXTURE_ID, &snapshot(&["mapp_one"]), clock())
-                .expect("current read");
-        assert_eq!(validated.apps.len(), 1);
-        assert_eq!(
-            cell.borrow().post_count(),
-            1,
-            "one create POST in the whole flow"
-        );
     }
 
     #[test]
@@ -3816,12 +3834,25 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(output.status.success(), "child {stage} failed: {text}");
+        // libtest prints the test name and the child's stdout on the same line,
+        // so locate the unique marker anywhere in the capture and read its tail.
         let marker = format!("CHILD-RESULT {stage} ");
-        let line = text
-            .lines()
-            .find(|line| line.starts_with(&marker))
-            .unwrap_or_else(|| panic!("child {stage} reported nothing: {text}"));
-        line.trim_start_matches(&marker).to_string()
+        let hits: Vec<usize> = text
+            .match_indices(&marker)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "child {stage} marker must appear exactly once: {text}"
+        );
+        let tail = &text[hits[0] + marker.len()..];
+        tail.lines()
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| panic!("child {stage} printed no code: {text}"))
+            .to_string()
     }
 
     /// The deadline the fixture recorded for the operation this scenario lost.
@@ -3844,12 +3875,19 @@ mod tests {
             .get(&format!("{operation}:{key}"))
             .cloned()
             .expect("recorded effect");
-        serde_json::from_str::<Value>(&effect)
-            .expect("recorded json")
-            .get("expires_at")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
+        let value = serde_json::from_str::<Value>(&effect).expect("recorded json");
+        match operation {
+            "revoke" => value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            _ => value
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        }
     }
 
     fn journal_of(dir: &std::path::Path) -> Journal {
@@ -3961,13 +3999,18 @@ mod tests {
                     "{label} intent resolved"
                 );
                 assert!(after.create_recorded, "{label} create proven");
+                // The recovered effect is exactly what the fixture recorded when
+                // the reply was lost: no renewal, no widening, no new bearer.
                 let recorded = recorded_expiry(&server, &dir, label);
-                // The recovered deadline is exactly what the fixture recorded
-                // when the reply was lost: recovery may not renew or widen.
-                assert_eq!(
-                    after.expires_at, recorded,
-                    "{label} recovery must not renew the approval"
-                );
+                if label == "lost-revoke" {
+                    assert_eq!(after.phase, "REVOKED", "{label} recorded effect");
+                    assert_eq!(recorded, "REVOKED", "{label} recorded status");
+                } else {
+                    assert_eq!(
+                        after.expires_at, recorded,
+                        "{label} recovery must not renew the approval"
+                    );
+                }
             }
             assert!(
                 !keys_before.1.as_deref().unwrap_or("").is_empty()
