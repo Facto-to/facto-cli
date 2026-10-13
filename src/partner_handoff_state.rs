@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 pub(crate) const JOURNAL_VERSION: u8 = 2;
+pub(crate) const ALPHABET: [u8; 32] = *b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub(crate) const CODE_LENGTH: usize = 10;
+const MATCHING_PREFIX: &str = "facto:partner-cli:matching:v1";
+pub(crate) const REALM: &str = "test";
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const PREFIX: &str = "authorization-";
@@ -39,6 +43,7 @@ pub(crate) enum StateError {
     JournalMissing,
     JournalInvalid,
     IntentConflict,
+    LockHeld,
     WriteFailed,
 }
 
@@ -50,6 +55,7 @@ impl StateError {
             Self::InsecureFile => "insecure_file",
             Self::JournalMissing => "journal_missing",
             Self::IntentConflict => "intent_conflict",
+            Self::LockHeld => "concurrent_writer",
         }
     }
 }
@@ -83,6 +89,44 @@ pub(crate) fn is_canonical_uuid(value: &str) -> bool {
         matches!(index, 8 | 13 | 18 | 23)
             || (byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     })
+}
+
+/// The pairing code is ten characters from the 32-glyph alphabet. It lives here
+/// so the stored journal and the outgoing hash can never disagree.
+pub(crate) fn normalize_pairing_code(input: &str) -> Option<String> {
+    let trimmed = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    if !trimmed.is_ascii() {
+        return None;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let candidate = match upper.len() {
+        11 if upper.as_bytes()[5] == b'-' => format!("{}{}", &upper[..5], &upper[6..]),
+        10 => upper,
+        _ => return None,
+    };
+    if candidate.len() != CODE_LENGTH || !candidate.bytes().all(|byte| ALPHABET.contains(&byte)) {
+        return None;
+    }
+    Some(candidate)
+}
+
+pub(crate) fn matching_canonical_bytes(authorization_id: &str, normalized: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(MATCHING_PREFIX.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(REALM.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(authorization_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(normalized.as_bytes());
+    bytes
+}
+
+pub(crate) fn verification_code_hash(authorization_id: &str, normalized: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(matching_canonical_bytes(authorization_id, normalized));
+    hex::encode(hasher.finalize())
 }
 
 fn parses_moment(value: &str) -> bool {
@@ -200,7 +244,30 @@ impl Journal {
     /// True when an original intent is still owed a receipt read. A lost create
     /// response must not be forgotten by starting a new pairing.
     pub(crate) fn has_unresolved_intent(&self) -> bool {
-        !self.create_recorded || !self.unknown.is_empty()
+        !self.create_recorded || !self.unknown.is_empty() || self.pending_intents().count() > 0
+    }
+
+    /// Every original intent that was claimed but never proven recorded. These
+    /// are receipt reads only; they can never become a new POST.
+    pub(crate) fn pending_intents(&self) -> Vec<&'static str> {
+        ["create", "exchange", "revoke"]
+            .into_iter()
+            .filter(|name| match *name {
+                "create" => !self.create_recorded,
+                "exchange" => self.exchange_request_id.is_some() && !self.exchange_recorded,
+                _ => self.revoke_request_id.is_some() && !self.revoke_recorded,
+            })
+            .collect()
+    }
+
+    pub(crate) fn occupies_store(&self, now: &DateTime<Utc>) -> bool {
+        if self.has_unresolved_intent() {
+            return true;
+        }
+        matches!(self.phase.as_str(), "PENDING" | "APPROVED" | "ACTIVE")
+            && self
+                .pairing_deadline()
+                .map_or(true, |deadline| deadline > *now)
     }
 
     pub(crate) fn pairing_deadline(&self) -> Option<DateTime<Utc>> {
@@ -225,7 +292,7 @@ impl Journal {
         if self.mode != "fresh" && self.mode != "reuse" {
             return Err(StateError::JournalInvalid);
         }
-        if !PHASES.contains(&self.phase) {
+        if !PHASES.contains(&self.phase.as_str()) {
             return Err(StateError::JournalInvalid);
         }
         if !is_lower_hex(&self.proof_hex, 64) || !is_canonical_uuid(&self.authorization_id) {
@@ -234,18 +301,21 @@ impl Journal {
         if self.create_request_id != self.authorization_id {
             return Err(StateError::JournalInvalid);
         }
-        if self.pairing_code.len() != 10
-            || !self
-                .pairing_code
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() && byte.is_ascii_alphabetic())
+        if normalize_pairing_code(&self.pairing_code).as_deref() != Some(self.pairing_code.as_str())
         {
             return Err(StateError::JournalInvalid);
         }
-        for value in [&self.expires_at, &self.created_at, &self.updated_at] {
-            if !parses_moment(value) {
-                return Err(StateError::JournalInvalid);
-            }
+        if self.created_at.is_empty()
+            || self.updated_at.is_empty()
+            || !parses_moment(&self.created_at)
+            || !parses_moment(&self.updated_at)
+            || !parses_moment(&self.expires_at)
+        {
+            return Err(StateError::JournalInvalid);
+        }
+        // Only an intent that has no server deadline yet may leave it empty.
+        if self.expires_at.is_empty() && !matches!(self.phase.as_str(), "PREWRITE" | "UNKNOWN") {
+            return Err(StateError::JournalInvalid);
         }
         for id in [
             &self.exchange_request_id,
@@ -284,7 +354,9 @@ impl Journal {
             .get("verification_code_hash")
             .and_then(serde_json::Value::as_str)
             .ok_or(StateError::JournalInvalid)?;
-        if !is_lower_hex(hash, 64) {
+        if !is_lower_hex(hash, 64)
+            || hash != &verification_code_hash(&self.authorization_id, &self.pairing_code)
+        {
             return Err(StateError::JournalInvalid);
         }
         if object.get("requested_actions") != Some(&serde_json::json!(actions)) {
@@ -325,6 +397,32 @@ impl std::fmt::Debug for Journal {
             .field("pairing_code", &"[REDACTED]")
             .field("create_body", &"[REDACTED]")
             .finish()
+    }
+}
+
+const LOCK_NAME: &str = ".lock";
+
+/// A short-lived mutual-exclusion token inside the private store, created with
+/// `create_new` under the 0700 chain and removed on drop. A lock left behind by
+/// a dead process is never stolen: the store stays fail-closed.
+pub(crate) struct StoreLock {
+    path: PathBuf,
+}
+
+impl StoreLock {
+    fn acquire(dir: &Path) -> Result<Self, StateError> {
+        let path = dir.join(LOCK_NAME);
+        let mut handle = open_exclusive(&path).map_err(|_| StateError::LockHeld)?;
+        let _ = handle.write_all(format!("pid={}\n", std::process::id()).as_bytes());
+        let _ = handle.sync_all();
+        drop(handle);
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -441,17 +539,14 @@ fn open_exclusive(path: &Path) -> std::io::Result<File> {
     ))
 }
 
-fn write_bytes(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), StateError> {
-    let exclusive = open_exclusive(path).is_ok();
-    if exclusive {
-        let file = open_exclusive(path).map_err(|_| StateError::WriteFailed)?;
-        drop(file);
-        let mut handle = OpenOptions::new()
-            .write(true)
-            .create(false)
-            .truncate(true)
-            .open(path)
-            .map_err(|_| StateError::WriteFailed)?;
+fn write_bytes(dir: &Path, path: &Path, bytes: &[u8], brand_new: bool) -> Result<(), StateError> {
+    if is_symlink(path) {
+        return Err(StateError::InsecureFile);
+    }
+    if brand_new {
+        // create_new is the fence, and the handle it returns is the one written
+        // through: a lost race reports a conflict and never overwrites an intent.
+        let mut handle = open_exclusive(path).map_err(|_| StateError::IntentConflict)?;
         handle
             .write_all(bytes)
             .map_err(|_| StateError::WriteFailed)?;
@@ -459,9 +554,6 @@ fn write_bytes(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), StateError> 
         handle.sync_all().map_err(|_| StateError::WriteFailed)?;
         drop(handle);
         return verify(dir, path, bytes);
-    }
-    if is_symlink(path) {
-        return Err(StateError::InsecureFile);
     }
     match mode_of(path) {
         Ok(FILE_MODE) | Err(_) => {}
@@ -507,18 +599,28 @@ pub(crate) fn create(dir: &Path, journal: &Journal) -> Result<(), StateError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(StateError::JournalInvalid);
     }
-    let path = journal_path(dir, &journal.authorization_id);
-    if path.exists() {
+    ensure_store(dir)?;
+    let _guard = StoreLock::acquire(dir)?;
+    // One store holds one live pairing: a parallel create cannot slip past it.
+    if scan_locked(dir)?.is_some_and(|other| other.occupies_store(&Utc::now())) {
         return Err(StateError::IntentConflict);
     }
-    write_bytes(dir, &path, &bytes)
+    let path = journal_path(dir, &journal.authorization_id);
+    write_bytes(dir, &path, &bytes, true)
 }
 
 /// Forward-only update of the same pairing.
 pub(crate) fn save(dir: &Path, journal: &Journal) -> Result<(), StateError> {
     journal.validate()?;
+    ensure_store(dir)?;
+    let _guard = StoreLock::acquire(dir)?;
+    save_locked(dir, journal)
+}
+
+fn save_locked(dir: &Path, journal: &Journal) -> Result<(), StateError> {
     let path = journal_path(dir, &journal.authorization_id);
-    if path.exists() {
+    let brand_new = !path.exists();
+    if !brand_new {
         let previous = read(&path)?;
         check_transition(&previous, journal)?;
     }
@@ -526,7 +628,26 @@ pub(crate) fn save(dir: &Path, journal: &Journal) -> Result<(), StateError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(StateError::JournalInvalid);
     }
-    write_bytes(dir, &path, &bytes)
+    write_bytes(dir, &path, &bytes, brand_new)
+}
+
+/// Read the stored pairing, apply one change and write it back while the lock
+/// is held, so two processes starting from the same state cannot both claim the
+/// right to send the same POST.
+pub(crate) fn claim<T>(
+    dir: &Path,
+    authorization_id: &str,
+    mutate: impl FnOnce(&mut Journal) -> Result<T, StateError>,
+) -> Result<T, StateError> {
+    ensure_store(dir)?;
+    let _guard = StoreLock::acquire(dir)?;
+    let path = journal_path(dir, authorization_id);
+    let mut journal = read(&path)?;
+    let outcome = mutate(&mut journal)?;
+    journal.updated_at = Utc::now().to_rfc3339();
+    journal.validate()?;
+    save_locked(dir, &journal)?;
+    Ok(outcome)
 }
 
 fn check_transition(previous: &Journal, journal: &Journal) -> Result<(), StateError> {
@@ -545,18 +666,28 @@ fn check_transition(previous: &Journal, journal: &Journal) -> Result<(), StateEr
     for (stored, next) in [
         (&previous.exchange_request_id, &journal.exchange_request_id),
         (&previous.revoke_request_id, &journal.revoke_request_id),
+    ] {
+        if stored.is_some() && stored != next {
+            return Err(StateError::IntentConflict);
+        }
+    }
+    for (stored, next) in [
         (
-            &previous.exchange_expected_revision,
-            &journal.exchange_expected_revision,
+            previous.exchange_expected_revision,
+            journal.exchange_expected_revision,
         ),
         (
-            &previous.revoke_expected_revision,
-            &journal.revoke_expected_revision,
+            previous.revoke_expected_revision,
+            journal.revoke_expected_revision,
         ),
     ] {
         if stored.is_some() && stored != next {
             return Err(StateError::IntentConflict);
         }
+    }
+    // The approved ceiling is immutable once recorded.
+    if previous.approval.is_some() && previous.approval != journal.approval {
+        return Err(StateError::IntentConflict);
     }
     // An original intent may only be dropped together with proof it was recorded.
     for name in &previous.unknown {
@@ -607,12 +738,20 @@ pub(crate) fn current(dir: &Path) -> Result<Journal, StateError> {
         return Err(StateError::JournalMissing);
     }
     ensure_store(dir)?;
+    let _guard = StoreLock::acquire(dir)?;
+    scan_locked(dir)?.ok_or(StateError::JournalMissing)
+}
+
+fn scan_locked(dir: &Path) -> Result<Option<Journal>, StateError> {
     let entries = fs::read_dir(dir).map_err(|_| StateError::InsecureStore)?;
     let mut newest: Option<Journal> = None;
     for entry in entries {
         let entry = entry.map_err(|_| StateError::InsecureStore)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        if name == LOCK_NAME {
+            continue;
+        }
         // A foreign leaf means the private store is not ours any more.
         if !name.starts_with(PREFIX) || !name.ends_with(SUFFIX) {
             return Err(StateError::InsecureStore);
@@ -626,7 +765,7 @@ pub(crate) fn current(dir: &Path) -> Result<Journal, StateError> {
             newest = Some(journal);
         }
     }
-    newest.ok_or(StateError::JournalMissing)
+    Ok(newest)
 }
 
 pub(crate) fn home_dir() -> Result<PathBuf, StateError> {
@@ -658,7 +797,7 @@ mod tests {
     fn body(id: &str, mode: &str) -> serde_json::Value {
         serde_json::json!({
             "request_id": id,
-            "verification_code_hash": "1cba9a1db5d50072c42010d9727b800d8ebf20ac7ce7efab3bd947b37c900901",
+            "verification_code_hash": verification_code_hash(id, "ABCDEFGHJK"),
             "requested_actions": ["workspace.access.read", "merchant.apps.read"],
             "mode": mode
         })
@@ -815,7 +954,7 @@ mod tests {
         assert_eq!(save(&dir, &stale).unwrap_err(), StateError::IntentConflict);
 
         entry.mark_unknown("create");
-        entry.touch(&later, "UNKNOWN", 0, "");
+        entry.touch(&later, "UNKNOWN", 1, "");
         save(&dir, &entry).expect("unknown recorded");
         assert_eq!(
             read(&journal_path(&dir, id)).expect("read").unknown,
@@ -921,6 +1060,16 @@ mod tests {
                 j.updated_at = "tomorrow".into();
                 j
             }),
+            ("hash not bound to the stored code", {
+                let mut j = journal(id);
+                j.create_body["verification_code_hash"] = serde_json::json!("1".repeat(64));
+                j
+            }),
+            ("empty created_at", {
+                let mut j = journal(id);
+                j.created_at = String::new();
+                j
+            }),
             ("zero expected revision", {
                 let mut j = journal(id);
                 j.exchange_expected_revision = Some(0);
@@ -946,6 +1095,46 @@ mod tests {
                 "{name}"
             );
         }
+
+        // The alphabet includes the digits 2-9, and the stored body must carry
+        // the hash of exactly the code that is stored.
+        let mut digits = journal(id);
+        digits.pairing_code = "ABCD234567".into();
+        digits.create_body["verification_code_hash"] =
+            serde_json::json!(verification_code_hash(id, "ABCD234567"));
+        digits.validate().expect("digits belong to the alphabet");
+        for ambiguous in ["ABCDEOGHJK", "ABCDEIGHJK", "ABCDE0GHJK", "ABCDE1GHJK"] {
+            let mut bad = digits.clone();
+            bad.pairing_code = ambiguous.into();
+            bad.create_body["verification_code_hash"] =
+                serde_json::json!(verification_code_hash(id, ambiguous));
+            assert_eq!(
+                bad.validate().unwrap_err(),
+                StateError::JournalInvalid,
+                "{ambiguous}"
+            );
+        }
+        let mut unbound = digits.clone();
+        unbound.create_body["verification_code_hash"] = serde_json::json!("1".repeat(64));
+        assert_eq!(
+            unbound.validate().unwrap_err(),
+            StateError::JournalInvalid,
+            "the body hash must bind the stored code"
+        );
+        let mut empty_stamp = digits.clone();
+        empty_stamp.created_at = String::new();
+        assert_eq!(
+            empty_stamp.validate().unwrap_err(),
+            StateError::JournalInvalid,
+            "created_at is never empty"
+        );
+        let mut early_expiry = digits.clone();
+        early_expiry.create_recorded = false;
+        early_expiry.phase = "PREWRITE".into();
+        early_expiry.expires_at = String::new();
+        early_expiry
+            .validate()
+            .expect("a PREWRITE intent may have no deadline");
     }
 
     #[cfg(unix)]
@@ -1021,6 +1210,8 @@ mod tests {
         ensure_store(&dir).expect("store");
         assert_eq!(current(&dir).unwrap_err(), StateError::JournalMissing);
         let mut older = journal("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        // A finished pairing does not occupy the store, so a second one may exist.
+        older.phase = "REVOKED".into();
         older.created_at = now().to_rfc3339();
         older.updated_at = Utc
             .with_ymd_and_hms(2026, 10, 13, 1, 0, 0)
