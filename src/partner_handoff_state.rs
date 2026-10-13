@@ -1244,7 +1244,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unresolved_intent_is_visible_to_the_next_process() {
+    fn unresolved_intent_survives_a_reload() {
         let dir = store_dir(&temp_root("intent"));
         ensure_store(&dir).expect("store");
         let id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";

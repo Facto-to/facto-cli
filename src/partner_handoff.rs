@@ -3055,7 +3055,7 @@ mod tests {
             "the pairing code survives the loss"
         );
 
-        // A second process reads that original receipt and posts nothing new.
+        // A reload of the same on-disk journal reads that receipt and posts nothing.
         let id = stored.authorization_id.clone();
         let cell2 = stub();
         cell2
@@ -3076,7 +3076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_process_reuses_the_exchange_intent_and_stays_unverified() {
+    async fn a_reloaded_journal_reuses_the_exchange_intent_and_stays_unverified() {
         let dir = store("exchange");
         let exchange_id = "77777777-7777-4777-8777-777777777777";
         let mut entry = journal(FIXTURE_ID);
