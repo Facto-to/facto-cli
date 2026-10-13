@@ -11,7 +11,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::header::{self, HeaderName, HeaderValue};
 use reqwest::{redirect, Client, Request, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -38,6 +38,7 @@ const MAX_POLL_TRANSPORT_FAILURES: u32 = 3;
 const PROOF_SCHEME: &str = "Facto-CLI ";
 const MAX_APPROVED_APPS: usize = 100;
 const ACTIONS: [&str; 2] = ["workspace.access.read", "merchant.apps.read"];
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 const SERVER_ERROR_CODES: [&str; 21] = [
     "invalid_request",
@@ -194,6 +195,7 @@ pub(crate) struct ApprovalSnapshot {
     pub(crate) partner_role_id: String,
     pub(crate) context_id: String,
     pub(crate) environment: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub(crate) authorization_revision: Option<u64>,
     pub(crate) granted_actions: Vec<String>,
     pub(crate) authorized_app_ids: Vec<String>,
@@ -209,6 +211,7 @@ pub(crate) struct AuthorizationView {
     pub(crate) status: String,
     pub(crate) revision: u64,
     pub(crate) expires_at: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub(crate) approval: Option<ApprovalSnapshot>,
 }
 
@@ -221,6 +224,7 @@ pub(crate) struct ExchangeResponse {
     pub(crate) status: String,
     pub(crate) previous_revision: u64,
     pub(crate) revision: u64,
+    #[serde(deserialize_with = "required_nullable")]
     pub(crate) approval: Option<ApprovalSnapshot>,
     pub(crate) session_id: String,
     pub(crate) expires_at: String,
@@ -235,6 +239,7 @@ pub(crate) struct RevocationResponse {
     pub(crate) status: String,
     pub(crate) previous_revision: u64,
     pub(crate) revision: u64,
+    #[serde(deserialize_with = "required_nullable")]
     pub(crate) approval: Option<ApprovalSnapshot>,
 }
 
@@ -257,6 +262,7 @@ pub(crate) struct WorkspaceResponse {
     pub(crate) membership_id: String,
     pub(crate) partner_role_id: String,
     pub(crate) environment: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub(crate) authorization_revision: Option<u64>,
     pub(crate) granted_actions: Vec<String>,
     pub(crate) authorized_app_ids: Vec<String>,
@@ -270,6 +276,7 @@ struct ReceiptWire {
     request_id: String,
     operation: String,
     status: String,
+    #[serde(deserialize_with = "required_nullable")]
     response: Option<serde_json::Value>,
 }
 
@@ -315,7 +322,7 @@ fn require_unique_ids(values: &[String]) -> Result<(), Failure> {
     }
     let mut seen = Vec::with_capacity(values.len());
     for value in values {
-        if value.is_empty() || value.len() > 128 || seen.contains(value) {
+        if !bounded_text(value, 1, 128) || seen.contains(value) {
             return Err(Failure::Local("wire_invalid"));
         }
         seen.push(value.clone());
@@ -392,11 +399,8 @@ fn check_snapshot_shape(snapshot: &ApprovalSnapshot) -> Result<(), Failure> {
         }
     }
     require_unique_ids(&snapshot.authorized_app_ids)?;
-    if snapshot
-        .authorization_revision
-        .is_some_and(|revision| revision == 0)
-    {
-        return Err(Failure::Local("wire_invalid"));
+    if let Some(revision) = snapshot.authorization_revision {
+        require_revision(revision)?;
     }
     require_moment(&snapshot.expires_at).map(|_| ())
 }
@@ -409,9 +413,7 @@ fn check_view_shape(view: &AuthorizationView, authorization_id: &str) -> Result<
     if !PHASES.contains(&view.status.as_str()) {
         return Err(Failure::Local("wire_invalid"));
     }
-    if view.revision == 0 {
-        return Err(Failure::Local("wire_invalid"));
-    }
+    require_revision(view.revision)?;
     require_moment(&view.expires_at)?;
     if let Some(snapshot) = &view.approval {
         check_snapshot_shape(snapshot)?;
@@ -436,13 +438,12 @@ fn check_exchange_shape(
     if !is_uuid(&response.session_id) || response.session_id != authorization_id {
         return Err(Failure::Local("wire_invalid"));
     }
-    if response.previous_revision == 0 {
-        return Err(Failure::Local("wire_invalid"));
-    }
+    require_revision(response.previous_revision)?;
     // Checked arithmetic: a hostile u64 cannot wrap the revision forward.
     let expected = response
         .previous_revision
         .checked_add(1)
+        .filter(|next| *next <= MAX_SAFE_INTEGER)
         .ok_or(Failure::Local("wire_invalid"))?;
     if response.revision != expected {
         return Err(Failure::Local("wire_invalid"));
@@ -494,7 +495,11 @@ fn check_revocation_shape(
     if response.authorization_id != authorization_id || response.request_id != request_id {
         return Err(Failure::Local("wire_invalid"));
     }
-    if !is_uuid(&response.request_id) || response.revision <= response.previous_revision {
+    if !is_uuid(&response.request_id) {
+        return Err(Failure::Local("wire_invalid"));
+    }
+    require_revision(response.previous_revision)?;
+    if response.revision <= response.previous_revision || response.revision > MAX_SAFE_INTEGER {
         return Err(Failure::Local("wire_invalid"));
     }
     if let Some(snapshot) = &response.approval {
@@ -525,19 +530,15 @@ fn check_workspace_shape(
         }
     }
     require_unique_ids(&workspace.authorized_app_ids)?;
-    if workspace
-        .authorization_revision
-        .is_some_and(|revision| revision == 0)
-    {
-        return Err(Failure::Local("wire_invalid"));
+    if let Some(revision) = workspace.authorization_revision {
+        require_revision(revision)?;
     }
     let mut listed: Vec<String> = Vec::new();
     for app in &workspace.apps {
-        if app.app_id.is_empty()
-            || app.app_id.len() > 128
-            || app.status.is_empty()
-            || app.status.len() > 64
-            || app.display_name.len() > 512
+        // The contract bounds these by Unicode scalars, not by bytes.
+        if !bounded_text(&app.app_id, 1, 128)
+            || !bounded_text(&app.status, 1, 64)
+            || !bounded_text(&app.display_name, 0, 512)
             || listed.contains(&app.app_id)
         {
             return Err(Failure::Local("wire_invalid"));
@@ -653,12 +654,11 @@ fn proof_headers(built: &Built) -> Result<Vec<(HeaderName, HeaderValue)>, Failur
             return Err(Failure::Local("wire_invalid"));
         }
     }
+    let mut proof_value = HeaderValue::from_str(&format!("{PROOF_SCHEME}{}", built.proof))
+        .map_err(|_| Failure::Local("wire_invalid"))?;
+    proof_value.set_sensitive(true);
     let mut headers = vec![
-        (
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("{PROOF_SCHEME}{}", built.proof))
-                .map_err(|_| Failure::Local("wire_invalid"))?,
-        ),
+        (header::AUTHORIZATION, proof_value),
         (
             HeaderName::from_static("x-facto-cli-request-id"),
             HeaderValue::from_str(&built.locator).map_err(|_| Failure::Local("wire_invalid"))?,
@@ -855,6 +855,28 @@ impl Sender {
     }
 }
 
+/// A nullable wire field must still be *present*: the machine contract lists it
+/// as required, so an absent value is a protocol violation rather than a null.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn require_revision(value: u64) -> Result<(), Failure> {
+    if value == 0 || value > MAX_SAFE_INTEGER {
+        return Err(Failure::Local("wire_invalid"));
+    }
+    Ok(())
+}
+
+fn bounded_text(value: &str, minimum: usize, maximum: usize) -> bool {
+    let count = value.chars().count();
+    count >= minimum && count <= maximum
+}
+
 fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Failure> {
     serde_json::from_slice(body).map_err(|_| Failure::Local("wire_invalid"))
 }
@@ -1030,6 +1052,38 @@ fn record_approval(journal: &mut Journal, snapshot: &ApprovalSnapshot) -> Result
     } else {
         Err(Failure::Local("cli_scope_changed"))
     }
+}
+
+/// Read back every original intent that is still owed an answer. This kernel is
+/// shared by `demo session` and by the two-process test seam, so recovery is
+/// never a test-only path.
+async fn recover_all(
+    dir: &std::path::Path,
+    sender: &Sender,
+    report: &mut Report,
+) -> Result<(Journal, Vec<String>), Failure> {
+    let mut journal = state::current(dir).map_err(|error| Failure::Local(error.code()))?;
+    let mut failures: Vec<String> = Vec::new();
+    for operation in journal.pending_intents() {
+        report.stage = "receipt";
+        let outcome: Result<(), Failure> = match operation {
+            "create" => match resume_create(dir, journal.clone(), sender, report).await {
+                Ok(updated) => {
+                    journal = updated;
+                    Ok(())
+                }
+                Err(failure) => Err(failure),
+            },
+            "exchange" => recover_exchange(dir, &mut journal, sender, report).await,
+            _ => recover_revoke(dir, &mut journal, sender, report).await,
+        };
+        if let Err(failure) = outcome {
+            failures.push(format!("{operation}:{}", failure.code()));
+        }
+        journal = state::read(&state::journal_path(dir, &journal.authorization_id))
+            .map_err(|error| Failure::Local(error.code()))?;
+    }
+    Ok((journal, failures))
 }
 
 fn stored_approval(journal: &Journal) -> Result<ApprovalSnapshot, Failure> {
@@ -1721,26 +1775,7 @@ async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Resu
 
     // Recovery reads only, driven by every persisted intent rather than by an
     // in-memory list: no create, exchange or refresh side effect happens here.
-    let mut failures: Vec<String> = Vec::new();
-    for operation in journal.pending_intents() {
-        report.stage = "receipt";
-        let outcome: Result<(), Failure> = match operation {
-            "create" => match resume_create(&dir, journal.clone(), &sender, report).await {
-                Ok(updated) => {
-                    journal = updated;
-                    Ok(())
-                }
-                Err(failure) => Err(failure),
-            },
-            "exchange" => recover_exchange(&dir, &mut journal, &sender, report).await,
-            _ => recover_revoke(&dir, &mut journal, &sender, report).await,
-        };
-        if let Err(failure) = outcome {
-            failures.push(format!("{operation}:{}", failure.code()));
-        }
-        journal = state::read(&state::journal_path(&dir, &journal.authorization_id))
-            .map_err(|error| Failure::Local(error.code()))?;
-    }
+    let (mut journal, failures) = recover_all(&dir, &sender, report).await?;
     if !journal.pending_intents().is_empty() {
         report.unknown_operations = Some(
             journal
@@ -1855,7 +1890,7 @@ pub(crate) async fn logout(target: &str, mode: &str, terse: bool) -> Result<()> 
 async fn logout_run(target: &str, sender: &Sender, report: &mut Report) -> Result<(), Failure> {
     reject_target(target)?;
     let dir = open_store()?;
-    let mut journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
+    let journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
     report.authorization_id = Some(journal.authorization_id.clone());
     report.phase = Some(journal.phase.clone());
     report.unknown_operations = Some(
@@ -1866,14 +1901,18 @@ async fn logout_run(target: &str, sender: &Sender, report: &mut Report) -> Resul
             .collect(),
     );
     report.stage = "revocation";
+    revoke_once(&dir, sender, report).await
+}
 
-    if journal.phase == "REVOKED" && journal.revoke_recorded && journal.pending_intents().is_empty()
-    {
-        // Already revoked: a repeat is a definite local success and never a
-        // second POST. The original receipt may still be read back.
-        report.effect = Some("revoke:SUCCEEDED".to_string());
-        return Ok(());
-    }
+/// The revocation kernel, independent of the process environment: it claims the
+/// intent durably, sends at most once, and otherwise reads the original
+/// receipt. The shipped command and the two-process test seam call this body.
+async fn revoke_once(
+    dir: &std::path::Path,
+    sender: &Sender,
+    report: &mut Report,
+) -> Result<(), Failure> {
+    let mut journal = state::current(dir).map_err(|error| Failure::Local(error.code()))?;
     if journal.revoke_recorded {
         report.effect = Some("revoke:SUCCEEDED".to_string());
         return Ok(());
@@ -1881,13 +1920,13 @@ async fn logout_run(target: &str, sender: &Sender, report: &mut Report) -> Resul
     if journal.revoke_request_id.is_some() {
         // An intent that exists was already sent by someone. Only the receipt
         // may answer, under the same request id and never a new key.
-        return recover_revoke(&dir, &mut journal, &sender, report).await;
+        return recover_revoke(dir, &mut journal, sender, report).await;
     }
     let candidate = new_uuid_v4()?;
-    let (owner, stored) = claim_intent(&dir, &journal, &candidate, journal.revision, "revoke")?;
+    let (owner, stored) = claim_intent(dir, &journal, &candidate, journal.revision, "revoke")?;
     journal = stored;
     if !owner {
-        return recover_revoke(&dir, &mut journal, &sender, report).await;
+        return recover_revoke(dir, &mut journal, sender, report).await;
     }
     let revoke_id = journal
         .revoke_request_id
@@ -1914,6 +1953,7 @@ async fn logout_run(target: &str, sender: &Sender, report: &mut Report) -> Resul
             check_revocation_shape(&response, &journal.authorization_id, &revoke_id)?;
             let next = expected_revision
                 .checked_add(1)
+                .filter(|value| *value <= MAX_SAFE_INTEGER)
                 .ok_or(Failure::Local("wire_invalid"))?;
             if response.previous_revision != expected_revision || response.revision != next {
                 return Err(Failure::Local("cli_scope_changed"));
@@ -1925,19 +1965,20 @@ async fn logout_run(target: &str, sender: &Sender, report: &mut Report) -> Resul
             journal.revoke_recorded = true;
             journal.clear_unknown("revoke");
             journal.touch(&now, &response.status, response.revision, "");
-            persist(&dir, &journal)?;
+            persist(dir, &journal)?;
             report.phase = Some(response.status.clone());
             report.revision = Some(response.revision);
             report.effect = Some(format!("revoke:{}", response.status));
         }
         // The claim already says the effect is unknown: read, never resend.
         Err(failure) => {
-            recover_revoke(&dir, &mut journal, &sender, report).await?;
+            recover_revoke(dir, &mut journal, sender, report).await?;
             return Err(failure);
         }
     }
     Ok(())
 }
+
 async fn recover_revoke(
     dir: &std::path::Path,
     journal: &mut Journal,
@@ -2170,6 +2211,9 @@ mod tests {
         redirect: Arc<AtomicUsize>,
         chunked: Arc<AtomicUsize>,
         widen: Arc<AtomicUsize>,
+        /// Receipt reads answered as UNKNOWN, to reproduce an effect that stays
+        /// unknown until a later process reads it again.
+        unknown_receipt: Arc<AtomicUsize>,
     }
 
     fn loopback() -> (String, Fixture) {
@@ -2186,6 +2230,7 @@ mod tests {
             redirect: Arc::new(AtomicUsize::new(0)),
             chunked: Arc::new(AtomicUsize::new(0)),
             widen: Arc::new(AtomicUsize::new(0)),
+            unknown_receipt: Arc::new(AtomicUsize::new(0)),
         };
         let server = fixture.clone();
         std::thread::spawn(move || {
@@ -2246,7 +2291,7 @@ mod tests {
         })
     }
 
-    fn respond_to(kind: &str, path: &str, body: &str, widen: bool) -> Value {
+    fn respond_to(kind: &str, path: &str, body: &str, widen: bool, unknown: bool) -> Value {
         let now = Utc::now();
         let auth = locator(path);
         let request_id = serde_json::from_str::<Value>(body)
@@ -2306,11 +2351,17 @@ mod tests {
                 "revision": 4,
                 "approval": snapshot_json(&["mapp_one"])
             }),
+            "receipt" if unknown => json!({
+                "request_id": request_id,
+                "operation": receipt_operation(path),
+                "status": "UNKNOWN",
+                "response": null
+            }),
             "receipt" => json!({
                 "request_id": request_id,
                 "operation": receipt_operation(path),
                 "status": "SUCCEEDED",
-                "response": respond_to(&receipt_operation(path), path, body, false)
+                "response": respond_to(&receipt_operation(path), path, body, false, false)
             }),
             _ => json!({
                 "session_id": auth,
@@ -2435,7 +2486,13 @@ mod tests {
             return;
         }
         let widen = fixture.widen.load(Ordering::SeqCst) > 0;
-        let payload = serde_json::to_vec(&respond_to(kind, &path, &body, widen)).expect("payload");
+        let unknown = if kind == "receipt" {
+            fixture.unknown_receipt.swap(0, Ordering::SeqCst) > 0
+        } else {
+            false
+        };
+        let payload =
+            serde_json::to_vec(&respond_to(kind, &path, &body, widen, unknown)).expect("payload");
         if fixture.chunked.load(Ordering::SeqCst) > 0 {
             fixture.chunked.fetch_sub(1, Ordering::SeqCst);
             let _ = stream.write_all(
@@ -3596,6 +3653,311 @@ mod tests {
             .pending_intents()
             .contains(&"exchange"));
         assert_eq!(cell.borrow().post_count(), 0);
+    }
+
+    // ── Two real OS child processes over one private journal ────────────────
+    //
+    // The child is the same test binary, spawned for real, running the shipped
+    // kernels against the parent's loopback server and one on-disk journal. The
+    // fixtures travel through child-only environment names inside `cfg(test)`;
+    // the public `demo authorize` terminal requirement is untouched and the
+    // production origin is never read from the environment.
+
+    const CHILD_ORIGIN: &str = "FACTO_CLI_TEST_CHILD_ORIGIN";
+    const CHILD_DIR: &str = "FACTO_CLI_TEST_CHILD_DIR";
+    const CHILD_STAGE: &str = "FACTO_CLI_TEST_CHILD_STAGE";
+
+    /// A pairing written to disk without ever reaching the wire: the window a
+    /// process leaves behind when it dies between the durable claim and the POST.
+    fn prewrite_only(dir: &std::path::Path) -> Result<String, state::StateError> {
+        let proof = new_proof().map_err(|_| state::StateError::WriteFailed)?;
+        let authorization_id = new_uuid_v4().map_err(|_| state::StateError::WriteFailed)?;
+        let code = new_pairing_code().map_err(|_| state::StateError::WriteFailed)?;
+        let hashed = verification_code_hash(&authorization_id, &code);
+        let body = CreateRequest {
+            request_id: &authorization_id,
+            verification_code_hash: &hashed,
+            requested_actions: ACTIONS,
+            mode: "fresh",
+        };
+        let value = serde_json::to_value(body).map_err(|_| state::StateError::JournalInvalid)?;
+        let journal = Journal::new(
+            "fresh",
+            &proof,
+            &code,
+            &authorization_id,
+            value,
+            &Utc::now(),
+        );
+        state::create(dir, &journal)?;
+        Ok(authorization_id)
+    }
+
+    async fn run_child_stage(origin: &str, dir: &std::path::Path, stage: &str) -> String {
+        let sender = loopback_sender(origin);
+        let mut report = Report::new("child_stage", "fresh", "precheck");
+        let outcome: Result<(), Failure> = match stage {
+            "create" => fresh_pairing("fresh", dir, &sender, &mut report, Utc::now())
+                .await
+                .map(|_| ()),
+            "prewrite" => prewrite_only(dir)
+                .map(|_| ())
+                .map_err(|_| Failure::Local("unsafe_local_state")),
+            "approve-exchange" => {
+                let mut journal = state::current(dir)
+                    .map_err(|error| Failure::Local(error.code()))
+                    .expect("child journal");
+                let deadline = journal
+                    .pairing_deadline()
+                    .unwrap_or_else(|| Utc::now() + Duration::seconds(120));
+                let approved = wait_for_approval(dir, &mut journal, &sender, deadline)
+                    .await
+                    .expect("child approved");
+                ensure_exchange(dir, &mut journal, &sender, &mut report, approved.revision).await
+            }
+            "revoke" => revoke_once(dir, &sender, &mut report).await,
+            "recover" => recover_all(dir, &sender, &mut report)
+                .await
+                .and_then(|(_, failures)| match failures.first() {
+                    None => Ok(()),
+                    Some(code) => Err(server_or_local(code.split(':').last().unwrap_or(""))),
+                }),
+            other => panic!("unknown child stage {other}"),
+        };
+        match outcome {
+            Ok(()) => "ok".to_string(),
+            Err(failure) => failure.code().to_string(),
+        }
+    }
+
+    #[test]
+    #[ignore = "child entry point: spawned by two_child_processes_recover_their_original_intents"]
+    fn child_pairing_kernel_entry() {
+        let origin = std::env::var(CHILD_ORIGIN).expect("child origin");
+        let dir = std::path::PathBuf::from(std::env::var(CHILD_DIR).expect("child journal dir"));
+        let stage = std::env::var(CHILD_STAGE).expect("child stage");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("child runtime");
+        let outcome = runtime.block_on(run_child_stage(&origin, &dir, &stage));
+        println!("CHILD-RESULT {stage} {outcome}");
+    }
+
+    fn spawn_child(origin: &str, dir: &std::path::Path, stage: &str) -> String {
+        let output = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "partner_handoff::tests::child_pairing_kernel_entry",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ORIGIN, origin)
+            .env(CHILD_DIR, dir.as_os_str())
+            .env(CHILD_STAGE, stage)
+            .output()
+            .expect("spawn child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "child {stage} failed: {text}");
+        let marker = format!("CHILD-RESULT {stage} ");
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&marker))
+            .unwrap_or_else(|| panic!("child {stage} reported nothing: {text}"));
+        line.trim_start_matches(&marker).to_string()
+    }
+
+    fn journal_of(dir: &std::path::Path) -> Journal {
+        state::current(dir).expect("journal")
+    }
+
+    #[tokio::test]
+    async fn two_child_processes_recover_their_original_intents_over_real_http() {
+        // scenario: (label, stages before the drop, dropped request, expected
+        // first-child code)
+        let cases: [(&str, &[&str], &str); 4] = [
+            ("prewrite", &["prewrite"], "ok"),
+            ("lost-create", &["create"], "receipt_unknown"),
+            (
+                "lost-exchange",
+                &["create", "approve-exchange"],
+                "receipt_unknown",
+            ),
+            (
+                "lost-revoke",
+                &["create", "approve-exchange", "revoke"],
+                "receipt_unknown",
+            ),
+        ];
+        for (label, stages, expected_first) in cases {
+            let (origin, server) = loopback();
+            let dir = store(&format!("children-{label}"));
+            for stage in stages.iter().take(stages.len() - 1) {
+                let code = spawn_child(&origin, &dir, stage);
+                assert_eq!(code, "ok", "{label} setup stage {stage}");
+            }
+            // Only the exchange and revocation windows address a known
+            // authorization; the create and pre-write windows do not need one.
+            let auth = match label {
+                "lost-exchange" | "lost-revoke" => journal_of(&dir).authorization_id.clone(),
+                _ => String::new(),
+            };
+            let target = match label {
+                "lost-create" | "prewrite" => format!("POST {PREFIX}/authorizations"),
+                "lost-exchange" => format!("POST {PREFIX}/authorizations/{auth}/exchanges"),
+                _ => format!("POST {PREFIX}/authorizations/{auth}/revocations"),
+            };
+            server
+                .drop_on
+                .lock()
+                .expect("drop lock")
+                .push(target.clone());
+            server.unknown_receipt.store(1, Ordering::SeqCst);
+
+            let first_stage = stages.last().expect("last stage");
+            let first_code = spawn_child(&origin, dir.as_path(), first_stage);
+            assert_eq!(first_code, expected_first, "{label} first child");
+
+            let posts_after_first = server.posts.load(Ordering::SeqCst);
+            let gets_after_first = server.gets.load(Ordering::SeqCst);
+            let before = journal_of(&dir);
+            let keys_before = (
+                before.create_request_id.clone(),
+                before.exchange_request_id.clone(),
+                before.revoke_request_id.clone(),
+            );
+            assert!(
+                !before.pending_intents().is_empty(),
+                "{label} keeps the original intent"
+            );
+
+            // The second, separate process: the reply is now reachable, and it
+            // may only read the same request ids.
+            server.unknown_receipt.store(0, Ordering::SeqCst);
+            let second = spawn_child(&origin, dir.as_path(), "recover");
+            assert_eq!(second, "ok", "{label} second child recovered");
+
+            let after = journal_of(&dir);
+            let keys_after = (
+                after.create_request_id.clone(),
+                after.exchange_request_id.clone(),
+                after.revoke_request_id.clone(),
+            );
+            assert_eq!(keys_before, keys_after, "{label} never swapped a key");
+            assert_eq!(
+                server.posts.load(Ordering::SeqCst),
+                posts_after_first,
+                "{label} the second child sent no POST"
+            );
+            assert!(
+                server.gets.load(Ordering::SeqCst) > gets_after_first,
+                "{label} the second child read the original receipt"
+            );
+            assert!(
+                after.pending_intents().is_empty(),
+                "{label} intent resolved"
+            );
+            assert!(after.create_recorded, "{label} create proven");
+            assert!(
+                !keys_before.1.as_deref().unwrap_or("").is_empty()
+                    || label == "lost-create"
+                    || label == "prewrite",
+                "{label} an exchange key is never invented later"
+            );
+            let seen = server.seen.lock().expect("seen");
+            assert!(
+                seen.iter().any(|line| line.contains(&format!(
+                    "/authorizations/{}/requests/",
+                    after.authorization_id
+                ))),
+                "{label} receipt reads are observable"
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_fields_must_be_present_and_values_stay_bounded() {
+        let base = approve_view();
+        // Explicit null is a legal answer while the pairing is unapproved.
+        let nulled = patch(base.clone(), "approval", Value::Null);
+        let view: AuthorizationView = parse(nulled.to_string().as_bytes()).expect("explicit null");
+        assert_eq!(view.approval, None);
+        // A missing key is a protocol violation, not a null.
+        let mut absent = base.as_object().expect("object").clone();
+        absent.remove("approval");
+        assert!(parse::<AuthorizationView>(Value::Object(absent).to_string().as_bytes()).is_err());
+
+        for bad in [json!(0), json!(MAX_SAFE_INTEGER + 1), json!(-1), json!("2")] {
+            let mutated = patch(base.clone(), "revision", bad);
+            let parsed: Result<AuthorizationView, _> = parse(mutated.to_string().as_bytes());
+            assert!(
+                parsed.is_err() || check_view_shape(&parsed.expect("wire"), FIXTURE_ID).is_err(),
+                "revision must stay inside 1..=safe-integer"
+            );
+        }
+
+        // authorization_revision is nullable but must be present, and a value
+        // keeps the same range.
+        let mut missing = workspace_view().as_object().expect("object").clone();
+        missing.remove("authorization_revision");
+        assert!(parse::<WorkspaceResponse>(Value::Object(missing).to_string().as_bytes()).is_err());
+        let zeroed = patch(workspace_view(), "authorization_revision", json!(0));
+        let zeroed: WorkspaceResponse = parse(zeroed.to_string().as_bytes()).expect("wire");
+        assert_eq!(
+            check_workspace_shape(&zeroed, FIXTURE_ID).unwrap_err(),
+            Failure::Local("wire_invalid")
+        );
+
+        // The contract bounds text by Unicode scalars, not by bytes.
+        let two_byte = "\u{e9}";
+        let accepted = patch(
+            workspace_view(),
+            "apps",
+            json!([{"app_id": "mapp_one", "display_name": two_byte.repeat(512), "status": "active"}]),
+        );
+        let accepted: WorkspaceResponse =
+            parse(accepted.to_string().as_bytes()).expect("wide name");
+        assert!(check_workspace_shape(&accepted, FIXTURE_ID).is_ok());
+        let rejected = patch(
+            workspace_view(),
+            "apps",
+            json!([{"app_id": "mapp_one", "display_name": two_byte.repeat(513), "status": "active"}]),
+        );
+        let rejected: WorkspaceResponse =
+            parse(rejected.to_string().as_bytes()).expect("longer name");
+        assert!(check_workspace_shape(&rejected, FIXTURE_ID).is_err());
+        for status in [String::new(), "s".repeat(65)] {
+            let mutated = patch(
+                workspace_view(),
+                "apps",
+                json!([{"app_id": "mapp_one", "display_name": "Shop", "status": status}]),
+            );
+            let parsed: WorkspaceResponse = parse(mutated.to_string().as_bytes()).expect("wire");
+            assert!(
+                check_workspace_shape(&parsed, FIXTURE_ID).is_err(),
+                "status {status:?} is out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn the_proof_header_is_marked_sensitive_and_stays_out_of_debug() {
+        let built = build_read(
+            &"a".repeat(64),
+            FIXTURE_ID,
+            format!("{PREFIX}/session/workspace"),
+        );
+        let (client, request) = live_request(&built).expect("request");
+        let value = request.headers().get(header::AUTHORIZATION).expect("auth");
+        assert!(value.is_sensitive(), "reqwest must not print the proof");
+        let rendered = format!("{built:?}");
+        assert!(!rendered.contains(&"a".repeat(64)), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        drop(client);
     }
 
     #[test]
