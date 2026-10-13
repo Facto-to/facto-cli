@@ -120,4 +120,42 @@ credentials and startup updates even without -t.
 - Do not infer authenticated access or UAT from either command. The output
   retains authentication_verified=false, installation_verified=false and
   uat_status=NOT_RUN. Never use this setup command to start payment/funding.
-- No Partner device authorization or other Demo adapters are provided yet.
+- Other Demo adapters (Lumina, Orbit, Meridian) are not provided by this slice.
+
+### Partner CLI handoff (Test only)
+
+Pair one CLI run with one explicit Partner approval, then read back the current
+authorized access. These commands use the dedicated Test wire and the private
+store `~/.facto/partner-cli/test/` only. They never read the Consumer
+credentials/config, never run the update check, never send a cookie and never
+accept an application client secret.
+
+```bash
+facto demo authorize    --demo shop --target test --mode fresh
+facto demo session      --demo shop --target test --mode reuse
+facto demo check-access --demo shop --target test --mode reuse
+facto demo logout       --demo shop --target test --mode reuse
+```
+
+- `authorize` draws one possession proof and one pairing code from the OS random
+  device, persists the pairing before the single create request, then opens
+  `https://test-partner.facto.to/cli/approve?authorization_id=<UUID>` and polls.
+  The named Developer approves in their own Partner session with the existing
+  recent MFA. Pending pairing lasts at most 10 minutes; the exchanged read ends
+  at the earliest of parent session, selected context and 15 minutes. Nothing
+  renews automatically.
+- The pairing code appears on the terminal only. Never put it in a URL, JSON
+  report, receipt or log. The proof never leaves the private store.
+- `session` reads the stored pairing plus original operation receipts; no
+  create/exchange/refresh. `check-access` performs exactly one current read and
+  returns public App metadata within the approved ceiling. `logout` revokes this
+  CLI pairing grant only, never membership, App, mandate or Consumer access.
+- Only `--target test` is accepted here; `--target dev` is refused for these
+  four commands while `plan`/`check` keep their Dev behaviour.
+- An unknown result is recovered by reading the original receipt: never repost,
+  never swap the idempotency key, never mint a second bearer. A missing,
+  symlinked or world-readable store is refused before any request.
+- Only a successful `check-access` read sets `authentication_verified=true`.
+  Every report keeps `uat_status=NOT_RUN`, `consumer_state_accessed=false` and
+  `app_secret_transport=false`. Never treat this slice as served deployment or
+  business acceptance.

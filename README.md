@@ -322,5 +322,49 @@ use Clap's nonzero parser exit. A successful check means configuration only:
 `authentication_verified=false`, `installation_verified=false`,
 and `uat_status=NOT_RUN` remain explicit. It does not prove
 permissions, SDK connectivity, callback delivery, consent, payments, deployed
-versions or business UAT. Partner device authorization and Lumina/Orbit/Meridian
-adapters are not implemented by this slice.
+versions or business UAT. Lumina/Orbit/Meridian adapters are not implemented by
+this slice.
+
+## Partner CLI handoff (Test only)
+
+These commands pair one CLI run with one explicit Partner approval, then read
+back the current authorized access. They use a dedicated Test wire and the
+private store `~/.facto/partner-cli/test/` only. They never read or write the
+Consumer `credentials.json` or `config.json`, never run the startup update
+check, never accept an application client secret, and never send a cookie.
+
+```bash
+facto demo authorize    --demo shop --target test --mode fresh
+facto demo session      --demo shop --target test --mode reuse
+facto demo check-access --demo shop --target test --mode reuse
+facto demo logout       --demo shop --target test --mode reuse
+```
+
+`authorize` generates one high-entropy possession proof and one pairing code
+from the OS random device, persists the pairing before the single create
+request, opens `https://test-partner.facto.to/cli/approve?authorization_id=<UUID>`
+and polls until the named Developer approves in their own signed-in Partner
+session. The pairing code is shown on the terminal only, never in the JSON
+report, a URL, a receipt or a log. Approval keeps the existing recent-MFA and
+context requirements; the CLI cannot approve, re-authenticate or extend
+anything. Pending pairing lasts at most ten minutes, the exchanged read session
+ends at the earliest of the parent session, the selected context and fifteen
+minutes, and nothing renews automatically.
+
+`session` reads the stored pairing and the original operation receipts. It
+never creates, exchanges or refreshes. `check-access` performs exactly one
+current read of `GET /api/partner-cli/session/workspace` and returns only public
+App metadata within the approved ceiling. `logout` revokes this CLI pairing
+grant only; it changes no membership, application, mandate or Consumer
+permission.
+
+Only `--target test` is supported here; `--target dev` is refused for these four
+commands while `plan` and `check` keep their Dev behaviour unchanged. If a
+request result is unknown the CLI reads that original receipt and never reposts,
+never swaps the idempotency key and never keeps a second bearer. A missing,
+symlinked or world-readable private store is refused before any request. Human
+output and help are English; `-t` emits one JSON report with
+`uat_status=NOT_RUN`, `consumer_state_accessed=false` and
+`app_secret_transport=false`. Only a successful `check-access` read sets
+`authentication_verified=true`, and no report in this slice claims served
+deployment or business acceptance.

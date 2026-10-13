@@ -26,6 +26,26 @@ pub(super) enum Command {
         #[arg(long)]
         demo_url: String,
     },
+    /// Pair this device with a Partner approval, then read back the current access.
+    Authorize {
+        #[command(flatten)]
+        selection: Selection,
+    },
+    /// Read back the stored pairing and any unknown operation receipts.
+    Session {
+        #[command(flatten)]
+        selection: Selection,
+    },
+    /// Verify the current authorized read of the stored pairing.
+    CheckAccess {
+        #[command(flatten)]
+        selection: Selection,
+    },
+    /// Revoke only this CLI pairing grant.
+    Logout {
+        #[command(flatten)]
+        selection: Selection,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -59,6 +79,15 @@ enum Target {
 enum Mode {
     Fresh,
     Reuse,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Reuse => "reuse",
+        }
+    }
 }
 
 impl Target {
@@ -395,8 +424,11 @@ fn render(output: &Report, terse: bool) -> Result<String> {
 }
 
 pub(super) async fn run(command: &Command, terse: bool) -> Result<()> {
-    let (output, failure) = match command {
-        Command::Plan { selection } => (plan(selection), None),
+    match command {
+        Command::Plan { selection } => {
+            let output = plan(selection);
+            emit_configuration(&output, None, terse)
+        }
         Command::Check {
             selection,
             demo_url,
@@ -409,17 +441,42 @@ pub(super) async fn run(command: &Command, terse: bool) -> Result<()> {
             match check_with_fetch(selection, demo_url, fetch_configuration).await {
                 Ok(config) => {
                     output.configuration = Some(config);
-                    (output, None)
+                    emit_configuration(&output, None, terse)
                 }
                 Err(error) => {
                     output.status = "failed";
                     output.error = Some(error.code());
-                    (output, Some(error))
+                    emit_configuration(&output, Some(error), terse)
                 }
             }
         }
-    };
-    println!("{}", render(&output, terse)?);
+        // The Partner handoff commands render their own reports and never touch
+        // Consumer credentials, configuration or the updater.
+        Command::Authorize { selection } => {
+            crate::partner_handoff::authorize(selection.target.name(), selection.mode.name(), terse)
+                .await
+        }
+        Command::Session { selection } => {
+            crate::partner_handoff::session(selection.target.name(), selection.mode.name(), terse)
+                .await
+        }
+        Command::CheckAccess { selection } => {
+            crate::partner_handoff::check_access(
+                selection.target.name(),
+                selection.mode.name(),
+                terse,
+            )
+            .await
+        }
+        Command::Logout { selection } => {
+            crate::partner_handoff::logout(selection.target.name(), selection.mode.name(), terse)
+                .await
+        }
+    }
+}
+
+fn emit_configuration(output: &Report, failure: Option<DemoError>, terse: bool) -> Result<()> {
+    println!("{}", render(output, terse)?);
     match failure {
         Some(error) => Err(error.into()),
         None => Ok(()),

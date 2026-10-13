@@ -2,6 +2,8 @@ mod api;
 mod config;
 mod demo;
 mod interactive;
+mod partner_handoff;
+mod partner_handoff_state;
 mod pay;
 mod pipeline_init;
 
