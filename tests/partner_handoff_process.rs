@@ -49,7 +49,20 @@ fn parsed(output: &Output) -> Value {
     serde_json::from_str(text.trim()).unwrap_or_else(|error| panic!("JSON stdout: {error}\n{text}"))
 }
 
+/// The handoff commands must never echo any endpoint, because they take their
+/// origin from the pinned constant alone.
 fn assert_never_reaches_network_or_state(output: &Output) {
+    let text = assert_no_credential_material(output);
+    assert!(
+        !text.contains("test-api.facto.to"),
+        "a handoff command echoed an endpoint: {text}"
+    );
+}
+
+/// Credential material never belongs in stdout or stderr. This is separate from
+/// the endpoint rule because the pre-existing Shop configuration commands print
+/// their public origins on purpose.
+fn assert_no_credential_material(output: &Output) -> String {
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -58,10 +71,6 @@ fn assert_never_reaches_network_or_state(output: &Output) {
     assert!(
         !text.contains("127.0.0.1"),
         "the Consumer endpoint leaked: {text}"
-    );
-    assert!(
-        !text.contains("test-api.facto.to"),
-        "an endpoint was echoed: {text}"
     );
     // 64 hex characters would mean a proof or hash crossed a public channel.
     let flat = text.to_string();
@@ -149,7 +158,31 @@ fn insecure_store_is_refused_without_a_post() {
             "{command} must refuse an open store"
         );
         let value = parsed(&output);
-        assert_eq!(value["error"], "unsafe_local_state", "{command}");
+        // `authorize` needs an interactive terminal and refuses before it ever
+        // looks at the store; the read commands must still refuse the open
+        // store itself. Neither may relax the terminal gate.
+        let expected = if command == "authorize" {
+            "pairing_requires_terminal"
+        } else {
+            "unsafe_local_state"
+        };
+        assert_eq!(value["error"], expected, "{command}");
+        assert_eq!(value["authentication_verified"], false, "{command}");
+        assert_eq!(value["stage"], "precheck", "{command}");
+        // The weak store is refused, never repaired, and no intent is claimed.
+        assert_eq!(
+            fs::symlink_metadata(&dir)
+                .expect("store meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "{command} must not loosen or tighten the refused store"
+        );
+        assert!(
+            !dir.join(".lock").exists(),
+            "{command} claimed a store lock"
+        );
         assert_never_reaches_network_or_state(&output);
     }
 }
@@ -175,7 +208,29 @@ fn symlinked_store_is_refused() {
             "{command} must refuse a linked store"
         );
         let value = parsed(&output);
-        assert_eq!(value["error"], "unsafe_local_state", "{command}");
+        let expected = if command == "authorize" {
+            "pairing_requires_terminal"
+        } else {
+            "unsafe_local_state"
+        };
+        assert_eq!(value["error"], expected, "{command}");
+        assert_eq!(value["authentication_verified"], false, "{command}");
+        // The indirection is refused as it stands: no writes land behind it.
+        assert!(
+            fs::symlink_metadata(facto.join("partner-cli").join("test"))
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "{command} replaced the symlinked store"
+        );
+        assert_eq!(
+            fs::read_dir(&real)
+                .expect("real dir")
+                .filter_map(|entry| entry.ok())
+                .count(),
+            0,
+            "{command} wrote through the symlink"
+        );
         assert_never_reaches_network_or_state(&output);
     }
 }
@@ -349,9 +404,18 @@ fn plan_and_check_keep_their_configuration_only_meaning() {
     assert_eq!(value["scope"], "configuration_only");
     assert_eq!(value["authentication_verified"], false);
     assert_eq!(value["uat_status"], "NOT_RUN");
+    // The explicit public origins are part of the original configuration-only
+    // contract from 8edb and are not credential material.
+    assert_eq!(value["origins"]["api"], "https://test-api.facto.to");
+    assert_eq!(value["origins"]["hosted"], "https://test.facto.to");
+    assert_eq!(value["installation_verified"], false);
     assert!(
         !store_dir(&home).exists(),
         "plan must not touch the pairing store"
+    );
+    assert!(
+        !home.join(".facto").join("credentials.json").exists(),
+        "plan must not read or write Consumer credentials"
     );
 
     let check = run(
@@ -382,7 +446,12 @@ fn plan_and_check_keep_their_configuration_only_meaning() {
         !store_dir(&home).exists(),
         "check must not touch the pairing store"
     );
-    assert_never_reaches_network_or_state(&check);
+    assert!(
+        !home.join(".facto").join("credentials.json").exists(),
+        "check must not read or write Consumer credentials"
+    );
+    // Public origins stay legal here; only credential material is fenced.
+    assert_no_credential_material(&check);
 }
 
 #[test]
