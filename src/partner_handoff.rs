@@ -1767,7 +1767,7 @@ pub(crate) async fn session(target: &str, mode: &str, terse: bool) -> Result<()>
 async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Result<(), Failure> {
     reject_target(target)?;
     let dir = open_store()?;
-    let mut journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
+    let journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
     report.stage = "authorization";
     report.authorization_id = Some(journal.authorization_id.clone());
     report.verification_uri = Some(approval_page_uri(&journal.authorization_id));
@@ -1775,7 +1775,7 @@ async fn session_run(target: &str, sender: &Sender, report: &mut Report) -> Resu
 
     // Recovery reads only, driven by every persisted intent rather than by an
     // in-memory list: no create, exchange or refresh side effect happens here.
-    let (mut journal, failures) = recover_all(&dir, &sender, report).await?;
+    let (mut journal, mut failures) = recover_all(&dir, &sender, report).await?;
     if !journal.pending_intents().is_empty() {
         report.unknown_operations = Some(
             journal
@@ -3014,19 +3014,18 @@ mod tests {
         report.verification_uri = Some(approval_page_uri(FIXTURE_ID));
         report.authentication_verified = true;
         let json = report.clone().succeeded().render(true);
-        for forbidden in [
+        let proof_shape = "a".repeat(64);
+        let forbidden: [&str; 7] = [
             "proof",
-            "a".repeat(64),
+            proof_shape.as_str(),
             "matching",
             "cookie",
             "secret",
             "ABCDEFGHJK",
             "FGHIJK",
-        ] {
-            assert!(
-                !json.contains(forbidden.as_str()),
-                "{forbidden} leaked: {json}"
-            );
+        ];
+        for needle in forbidden {
+            assert!(!json.contains(needle), "{needle} leaked: {json}");
         }
         assert!(json.contains("\"uat_status\":\"NOT_RUN\""));
         assert!(json.contains("\"consumer_state_accessed\":false"));
@@ -3279,7 +3278,15 @@ mod tests {
         assert_eq!(approved.status, "APPROVED");
         journal.record_exchange_intent(exchange_id, approved.revision);
         persist(&dir, &journal).expect("intent");
-        let journal = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("reread");
+        let reread = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("reread");
+        // The intent survived the write-ahead step unchanged: same create and
+        // exchange request ids, still the pre-exchange phase.
+        assert_eq!(reread.authorization_id, FIXTURE_ID);
+        assert_eq!(reread.create_request_id, FIXTURE_ID);
+        assert_eq!(reread.exchange_request_id.as_deref(), Some(exchange_id));
+        assert_eq!(reread.exchange_expected_revision, Some(approved.revision));
+        assert_eq!(reread.phase, "APPROVED");
+        assert!(!reread.exchange_recorded);
         let response: ExchangeResponse =
             parse(exchange_view(exchange_id).to_string().as_bytes()).expect("wire");
         validate_exchange(
@@ -3750,6 +3757,7 @@ mod tests {
                 "--exact",
                 "partner_handoff::tests::child_pairing_kernel_entry",
                 "--ignored",
+                "--nocapture",
                 "--test-threads=1",
             ])
             .env(CHILD_ORIGIN, origin)
