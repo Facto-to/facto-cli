@@ -3064,11 +3064,7 @@ mod tests {
         let mut report = Report::new("partner_cli_session", "fresh", "precheck");
         let outcome = resume_create(&dir, stored, &Sender::Stub(cell2.clone()), &mut report).await;
         assert_eq!(outcome.unwrap_err(), Failure::Local("receipt_unknown"));
-        assert_eq!(
-            cell2.borrow().post_count(),
-            0,
-            "the second process never re-posts"
-        );
+        assert_eq!(cell2.borrow().post_count(), 0, "the reload never re-posts");
         assert_eq!(cell2.borrow().fetched.len(), 1);
         assert!(state::current(&dir)
             .expect("still unresolved")
