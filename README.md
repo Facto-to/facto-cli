@@ -344,7 +344,10 @@ facto demo logout       --demo shop --target test --mode reuse
 from the OS random device, persists the pairing before the single create
 request, opens `https://test-partner.facto.to/cli/approve?authorization_id=<UUID>`
 and polls until the named Developer approves in their own signed-in Partner
-session. The pairing code is shown on the terminal only, never in the JSON
+session. It requires an interactive terminal: in normal mode that is stdout, in
+`-t` mode stderr, because the pairing code is only ever printed there. Without a
+terminal the command refuses with `pairing_requires_terminal` before creating
+the private store or sending any request, and it never opens a browser. The pairing code is shown on the terminal only, never in the JSON
 report, a URL, a receipt or a log. Approval keeps the existing recent-MFA and
 context requirements; the CLI cannot approve, re-authenticate or extend
 anything. Pending pairing lasts at most ten minutes, the exchanged read session
@@ -352,7 +355,11 @@ ends at the earliest of the parent session, the selected context and fifteen
 minutes, and nothing renews automatically.
 
 `session` reads the stored pairing and the original operation receipts. It
-never creates, exchanges or refreshes. `check-access` performs exactly one
+never creates, exchanges or refreshes, and it reports the original effect
+without claiming current access. A pairing whose create result is unknown stays
+unresolved: only `session` reading that same receipt, or `logout` revoking the
+original intent, can move it forward, so an interrupted run never produces a
+second authorization. `check-access` performs exactly one
 current read of `GET /api/partner-cli/session/workspace` and returns only public
 App metadata within the approved ceiling. `logout` revokes this CLI pairing
 grant only; it changes no membership, application, mandate or Consumer

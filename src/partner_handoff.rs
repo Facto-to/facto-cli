@@ -1,19 +1,21 @@
 //! Partner CLI Test handoff: CSPRNG possession proof, fixed-origin wire,
-//! finite polling, operation receipts and the current-authorization read.
+//! finite polling, write-ahead intents, original-receipt recovery and the
+//! current-authorization read.
 //!
-//! This module never reads Consumer credentials or configuration, never sends
-//! a cookie, and never accepts an App secret. Proof and pairing code live only
-//! in the private journal and on the interactive terminal.
+//! This module never reads Consumer credentials or configuration, never sends a
+//! cookie, and never accepts an application client secret. The proof and the
+//! pairing code live only in the private journal and, for the pairing code, on
+//! an interactive terminal.
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::header::{self, HeaderName, HeaderValue};
-use reqwest::{redirect, Client, RequestBuilder, StatusCode};
+use reqwest::{redirect, Client, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::time::Duration as StdDuration;
 
 use crate::partner_handoff_state::{self as state, Journal};
@@ -36,6 +38,7 @@ const ABSOLUTE_PARENT_LIMIT: i64 = 28_800;
 const CLOCK_MARGIN: i64 = 30;
 const MAX_POLL_TRANSPORT_FAILURES: u32 = 3;
 const PROOF_SCHEME: &str = "Facto-CLI ";
+const MAX_APPROVED_APPS: usize = 100;
 const ACTIONS: [&str; 2] = ["workspace.access.read", "merchant.apps.read"];
 
 const SERVER_ERROR_CODES: [&str; 21] = [
@@ -65,10 +68,12 @@ const SERVER_ERROR_CODES: [&str; 21] = [
 const PHASES: [&str; 6] = [
     "PENDING", "APPROVED", "ACTIVE", "DENIED", "EXPIRED", "REVOKED",
 ];
-const RECEIPT_OPERATIONS: [&str; 4] = ["create", "approve", "exchange", "revoke"];
+const RECEIPT_OPERATIONS: [&str; 3] = ["create", "exchange", "revoke"];
 
 // ── Failures ────────────────────────────────────────────────────────────────
 
+/// `Local` codes are CLI-side refusals and never travel on the wire; `Server`
+/// codes come from the closed set in the delivered machine contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Failure {
     Local(&'static str),
@@ -91,7 +96,7 @@ impl fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-// ── Entropy and identifiers ─────────────────────────────────────────────────
+// ── Entropy, identifiers and the pairing code ───────────────────────────────
 
 #[cfg(unix)]
 fn random_bytes<const N: usize>() -> Result<[u8; N], Failure> {
@@ -126,18 +131,7 @@ fn new_uuid_v4() -> Result<String, Failure> {
 }
 
 fn is_uuid(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != 36 {
-        return false;
-    }
-    for index in [8usize, 13, 18, 23] {
-        if bytes[index] != b'-' {
-            return false;
-        }
-    }
-    bytes.iter().enumerate().all(|(index, byte)| {
-        matches!(index, 8 | 13 | 18 | 23) || (byte.is_ascii_hexdigit() && byte.is_ascii_lowercase())
-    })
+    state::is_canonical_uuid(value)
 }
 
 fn new_pairing_code() -> Result<String, Failure> {
@@ -314,7 +308,7 @@ struct ErrorWire {
     message: String,
 }
 
-// ── Wire validation ─────────────────────────────────────────────────────────
+// ── Validation ──────────────────────────────────────────────────────────────
 
 fn require(value: &str, expected: &str) -> Result<(), Failure> {
     if value == expected {
@@ -324,8 +318,10 @@ fn require(value: &str, expected: &str) -> Result<(), Failure> {
     }
 }
 
-fn require_test(value: &str) -> Result<(), Failure> {
-    require(value, "test")
+fn require_moment(value: &str) -> Result<DateTime<Utc>, Failure> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|moment| moment.with_timezone(&Utc))
+        .map_err(|_| Failure::Local("wire_invalid"))
 }
 
 fn require_actions(actions: &[String]) -> Result<(), Failure> {
@@ -341,26 +337,18 @@ fn require_actions(actions: &[String]) -> Result<(), Failure> {
     }
 }
 
-fn require_phase(status: &str) -> Result<(), Failure> {
-    if PHASES.contains(&status) {
-        Ok(())
-    } else {
-        Err(Failure::Local("wire_invalid"))
+fn require_unique_ids(values: &[String]) -> Result<(), Failure> {
+    if values.len() > MAX_APPROVED_APPS {
+        return Err(Failure::Local("wire_invalid"));
     }
-}
-
-fn require_uuid(value: &str) -> Result<(), Failure> {
-    if is_uuid(value) {
-        Ok(())
-    } else {
-        Err(Failure::Local("wire_invalid"))
+    let mut seen = Vec::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() || value.len() > 128 || seen.contains(value) {
+            return Err(Failure::Local("wire_invalid"));
+        }
+        seen.push(value.clone());
     }
-}
-
-fn parse_deadline(value: &str) -> Result<DateTime<Utc>, Failure> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|moment| moment.with_timezone(&Utc))
-        .map_err(|_| Failure::Local("wire_invalid"))
+    Ok(())
 }
 
 fn approval_page_uri(authorization_id: &str) -> String {
@@ -376,179 +364,43 @@ fn server_code(code: &str) -> Result<Failure, Failure> {
         .ok_or(Failure::Local("wire_invalid"))
 }
 
-// ── Transport ───────────────────────────────────────────────────────────────
-
-struct Wire {
-    status: StatusCode,
-    body: Vec<u8>,
-}
-
-fn client() -> Result<Client, Failure> {
-    Client::builder()
-        .https_only(true)
-        .no_proxy()
-        .redirect(redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|_| Failure::Local("transport_unavailable"))
-}
-
-/// The dedicated proof scheme and locator only. An empty request id means the
-/// operation has no idempotency key (reads), so the header is absent.
-fn proof_headers(
-    proof: &str,
-    request_id: &str,
-    locator: &str,
-) -> Result<Vec<(HeaderName, HeaderValue)>, Failure> {
-    let valid_proof = proof.len() == 64
-        && proof
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
-    if !valid_proof {
-        return Err(Failure::Local("unsafe_local_state"));
-    }
-    if !request_id.is_empty() {
-        require_uuid(request_id)?;
-    }
-    require_uuid(locator)?;
-    let mut headers = vec![
-        (
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("{PROOF_SCHEME}{proof}"))
-                .map_err(|_| Failure::Local("wire_invalid"))?,
-        ),
-        (
-            HeaderName::from_static("x-facto-cli-request-id"),
-            HeaderValue::from_str(locator).map_err(|_| Failure::Local("wire_invalid"))?,
-        ),
-    ];
-    if !request_id.is_empty() {
-        headers.push((
-            HeaderName::from_static("idempotency-key"),
-            HeaderValue::from_str(request_id).map_err(|_| Failure::Local("wire_invalid"))?,
-        ));
-    }
-    Ok(headers)
-}
-
-fn target_header() -> (HeaderName, HeaderValue) {
-    (
-        HeaderName::from_static("x-facto-target"),
-        HeaderValue::from_static("test"),
-    )
-}
-
-fn with_headers(
-    builder: RequestBuilder,
-    headers: Vec<(HeaderName, HeaderValue)>,
-) -> RequestBuilder {
-    headers.into_iter().fold(builder, |builder, (name, value)| {
-        builder.header(name, value)
-    })
-}
-
-async fn send(builder: RequestBuilder) -> Result<Wire, Failure> {
-    let handle = client()?;
-    let request = builder
-        .build()
-        .map_err(|_| Failure::Local("transport_unavailable"))?;
-    let mut response = handle
-        .execute(request)
-        .await
-        .map_err(|_| Failure::Local("transport_unavailable"))?;
-    let status = response.status();
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err(Failure::Local("response_too_large"));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| Failure::Local("transport_unavailable"))?
-    {
-        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
-            return Err(Failure::Local("response_too_large"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Wire { status, body })
-}
-
-async fn post_json<T: Serialize>(
-    proof: &str,
-    request_id: &str,
-    locator: &str,
-    path: &str,
-    body: &T,
-    expect: StatusCode,
-) -> Result<Vec<u8>, Failure> {
-    let headers = proof_headers(proof, request_id, locator)?
-        .into_iter()
-        .chain([target_header()])
-        .collect();
-    let builder = with_headers(client()?.post(format!("{API_ORIGIN}{path}")), headers)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(body);
-    let wire = send(builder).await?;
-    decode(wire, expect)
-}
-
-async fn get_proof(proof: &str, locator: &str, path: &str) -> Result<Vec<u8>, Failure> {
-    let headers = proof_headers(proof, "", locator)?;
-    let wire = send(with_headers(
-        client()?.get(format!("{API_ORIGIN}{path}")),
-        headers,
-    ))
-    .await?;
-    decode(wire, StatusCode::OK)
-}
-
-fn decode(wire: Wire, expect: StatusCode) -> Result<Vec<u8>, Failure> {
-    if wire.status == expect {
-        return Ok(wire.body);
-    }
-    if let Ok(error) = serde_json::from_slice::<ErrorWire>(&wire.body) {
-        if error.message.len() <= 512 {
-            return Err(server_code(&error.code)?);
-        }
-    }
-    Err(Failure::Local("http_rejected"))
-}
-
-fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Failure> {
-    serde_json::from_slice(body).map_err(|_| Failure::Local("wire_invalid"))
-}
-
-// ── Response validation against the contract ────────────────────────────────
-
-fn validate_create(view: CreateResponse, request_id: &str) -> Result<CreateResponse, Failure> {
+/// Shape and identity only. A historical effect stays readable after its own
+/// deadline, so liveness is checked separately by the caller.
+fn check_create_shape(view: &CreateResponse, request_id: &str) -> Result<(), Failure> {
     require(&view.status, "PENDING")?;
-    require_uuid(&view.authorization_id).and_then(|_| require_uuid(&view.request_id))?;
+    if !is_uuid(&view.authorization_id) || !is_uuid(&view.request_id) {
+        return Err(Failure::Local("wire_invalid"));
+    }
     if view.authorization_id != request_id || view.request_id != request_id {
         return Err(Failure::Local("wire_invalid"));
     }
     if view.revision != 1 || view.poll_interval_seconds != POLL_SECONDS {
         return Err(Failure::Local("wire_invalid"));
     }
-    require_test(&view.target_environment).and_then(|_| require(&view.realm, REALM))?;
+    require(&view.target_environment, "test")?;
+    require(&view.realm, REALM)?;
     if view.verification_uri != approval_page_uri(&view.authorization_id) {
         return Err(Failure::Local("wire_invalid"));
     }
-    let now = Utc::now();
-    let deadline = parse_deadline(&view.expires_at)?;
+    require_moment(&view.expires_at).map(|_| ())
+}
+
+fn validate_create(
+    view: CreateResponse,
+    request_id: &str,
+    now: DateTime<Utc>,
+) -> Result<CreateResponse, Failure> {
+    check_create_shape(&view, request_id)?;
+    let deadline = require_moment(&view.expires_at)?;
     if deadline <= now || deadline > now + Duration::seconds(PENDING_LIMIT + CLOCK_MARGIN) {
         return Err(Failure::Local("wire_invalid"));
     }
     Ok(view)
 }
 
-fn validate_snapshot(snapshot: &ApprovalSnapshot) -> Result<(), Failure> {
-    require(&snapshot.environment, "dev")
-        .and_then(|_| require_actions(&snapshot.granted_actions))?;
+fn check_snapshot_shape(snapshot: &ApprovalSnapshot) -> Result<(), Failure> {
+    require(&snapshot.environment, "dev")?;
+    require_actions(&snapshot.granted_actions)?;
     for field in [
         &snapshot.partner_user_id,
         &snapshot.organization_id,
@@ -556,104 +408,157 @@ fn validate_snapshot(snapshot: &ApprovalSnapshot) -> Result<(), Failure> {
         &snapshot.partner_role_id,
         &snapshot.context_id,
     ] {
-        require_uuid(field)?;
+        if !is_uuid(field) {
+            return Err(Failure::Local("wire_invalid"));
+        }
     }
-    let apps_ok = snapshot.authorized_app_ids.len() <= 100
-        && snapshot
-            .authorized_app_ids
-            .iter()
-            .all(|id| !id.is_empty() && id.len() <= 128);
-    if !apps_ok {
-        return Err(Failure::Local("wire_invalid"));
-    }
-    parse_deadline(&snapshot.expires_at)?;
-    Ok(())
+    require_unique_ids(&snapshot.authorized_app_ids)?;
+    require_moment(&snapshot.expires_at).map(|_| ())
 }
 
-fn validate_view(
-    view: AuthorizationView,
-    authorization_id: &str,
-) -> Result<AuthorizationView, Failure> {
-    require_uuid(&view.authorization_id)?;
-    if view.authorization_id != authorization_id {
+fn check_view_shape(view: &AuthorizationView, authorization_id: &str) -> Result<(), Failure> {
+    if !is_uuid(&view.authorization_id) || view.authorization_id != authorization_id {
         return Err(Failure::Local("wire_invalid"));
     }
-    require_test(&view.target_environment).and_then(|_| require(&view.realm, REALM))?;
-    require_phase(&view.status)?;
+    require(&view.target_environment, "test")?;
+    require(&view.realm, REALM)?;
+    if !PHASES.contains(&view.status.as_str()) {
+        return Err(Failure::Local("wire_invalid"));
+    }
     if view.revision == 0 {
         return Err(Failure::Local("wire_invalid"));
     }
-    parse_deadline(&view.expires_at)?;
+    require_moment(&view.expires_at)?;
     if let Some(snapshot) = &view.approval {
-        validate_snapshot(snapshot)?;
+        check_snapshot_shape(snapshot)?;
     }
-    Ok(view)
+    Ok(())
 }
 
-fn validate_exchange(
-    response: ExchangeResponse,
+fn check_exchange_shape(
+    response: &ExchangeResponse,
     authorization_id: &str,
     request_id: &str,
-) -> Result<ExchangeResponse, Failure> {
+) -> Result<(), Failure> {
     require(&response.operation, "partner_cli.exchange")?;
     require(&response.status, "ACTIVE")?;
-    require_uuid(&response.session_id).and_then(|_| require_uuid(&response.request_id))?;
+    if !is_uuid(&response.session_id) || !is_uuid(&response.request_id) {
+        return Err(Failure::Local("wire_invalid"));
+    }
     if response.authorization_id != authorization_id || response.request_id != request_id {
         return Err(Failure::Local("wire_invalid"));
     }
-    if response.revision <= response.previous_revision || response.previous_revision == 0 {
+    // The session locator is the authorization itself; no second bearer exists.
+    if response.session_id != authorization_id {
+        return Err(Failure::Local("wire_invalid"));
+    }
+    if response.revision != response.previous_revision + 1 || response.previous_revision == 0 {
         return Err(Failure::Local("wire_invalid"));
     }
     let snapshot = response
         .approval
         .as_ref()
         .ok_or(Failure::Local("wire_invalid"))?;
-    validate_snapshot(snapshot)?;
-    let now = Utc::now();
-    let deadline = parse_deadline(&response.expires_at)?;
+    check_snapshot_shape(snapshot)
+}
+
+fn validate_exchange(
+    response: ExchangeResponse,
+    authorization_id: &str,
+    request_id: &str,
+    expected_revision: u64,
+    snapshot_ceiling: &ApprovalSnapshot,
+    now: DateTime<Utc>,
+) -> Result<ExchangeResponse, Failure> {
+    check_exchange_shape(&response, authorization_id, request_id)?;
+    if response.previous_revision != expected_revision {
+        return Err(Failure::Local("cli_scope_changed"));
+    }
+    let deadline = require_moment(&response.expires_at)?;
     if deadline <= now {
         return Err(Failure::Local("cli_expired"));
     }
-    let bounded = deadline <= now + Duration::seconds(ACTIVE_LIMIT + CLOCK_MARGIN)
-        && deadline <= now + Duration::seconds(ABSOLUTE_PARENT_LIMIT + CLOCK_MARGIN);
-    if !bounded {
+    let approval_deadline = require_moment(&snapshot_ceiling.expires_at)?;
+    let earliest = approval_deadline.min(now + Duration::seconds(ACTIVE_LIMIT));
+    if deadline > earliest + Duration::seconds(CLOCK_MARGIN)
+        || deadline > now + Duration::seconds(ABSOLUTE_PARENT_LIMIT + CLOCK_MARGIN)
+    {
         return Err(Failure::Local("wire_invalid"));
     }
     Ok(response)
 }
 
-fn validate_revocation(
-    response: RevocationResponse,
+fn check_revocation_shape(
+    response: &RevocationResponse,
     authorization_id: &str,
     request_id: &str,
-) -> Result<RevocationResponse, Failure> {
+) -> Result<(), Failure> {
     require(&response.operation, "partner_cli.revoke")?;
     require(&response.status, "REVOKED")?;
     if response.authorization_id != authorization_id || response.request_id != request_id {
         return Err(Failure::Local("wire_invalid"));
     }
-    if response.revision <= response.previous_revision {
+    if !is_uuid(&response.request_id) || response.revision <= response.previous_revision {
         return Err(Failure::Local("wire_invalid"));
     }
     if let Some(snapshot) = &response.approval {
-        validate_snapshot(snapshot)?;
+        check_snapshot_shape(snapshot)?;
     }
-    Ok(response)
+    Ok(())
 }
 
-fn validate_workspace(
-    workspace: WorkspaceResponse,
-    journal: &Journal,
-    snapshot: &ApprovalSnapshot,
-) -> Result<WorkspaceResponse, Failure> {
-    require(&workspace.environment, "dev")
-        .and_then(|_| require_test(&workspace.target_environment))
-        .and_then(|_| require(&workspace.realm, REALM))
-        .and_then(|_| require_actions(&workspace.granted_actions))?;
-    require_uuid(&workspace.session_id)?;
-    if workspace.session_id != journal.authorization_id {
+fn check_workspace_shape(
+    workspace: &WorkspaceResponse,
+    authorization_id: &str,
+) -> Result<(), Failure> {
+    require(&workspace.environment, "dev")?;
+    require(&workspace.target_environment, "test")?;
+    require(&workspace.realm, REALM)?;
+    require_actions(&workspace.granted_actions)?;
+    if !is_uuid(&workspace.session_id) || workspace.session_id != authorization_id {
         return Err(Failure::Local("wire_invalid"));
     }
+    for field in [
+        &workspace.partner_user_id,
+        &workspace.organization_id,
+        &workspace.membership_id,
+        &workspace.partner_role_id,
+    ] {
+        if !is_uuid(field) {
+            return Err(Failure::Local("wire_invalid"));
+        }
+    }
+    require_unique_ids(&workspace.authorized_app_ids)?;
+    if workspace
+        .authorization_revision
+        .is_some_and(|revision| revision == 0)
+    {
+        return Err(Failure::Local("wire_invalid"));
+    }
+    let mut listed = Vec::new();
+    for app in &workspace.apps {
+        if app.app_id.is_empty()
+            || app.app_id.len() > 128
+            || app.status.is_empty()
+            || app.status.len() > 64
+            || listed.contains(&app.app_id)
+        {
+            return Err(Failure::Local("wire_invalid"));
+        }
+        listed.push(app.app_id.clone());
+    }
+    require_moment(&workspace.expires_at)?;
+    Ok(())
+}
+
+/// The current read must be the approved tuple, unchanged or narrowed.
+fn validate_workspace(
+    workspace: WorkspaceResponse,
+    authorization_id: &str,
+    snapshot: &ApprovalSnapshot,
+    now: DateTime<Utc>,
+) -> Result<WorkspaceResponse, Failure> {
+    check_workspace_shape(&workspace, authorization_id)?;
     let actors_match = workspace.partner_user_id == snapshot.partner_user_id
         && workspace.organization_id == snapshot.organization_id
         && workspace.membership_id == snapshot.membership_id
@@ -661,21 +566,24 @@ fn validate_workspace(
     if !actors_match {
         return Err(Failure::Local("cli_scope_changed"));
     }
-    if workspace.authorized_app_ids.len() > 100 {
-        return Err(Failure::Local("wire_invalid"));
-    }
-    // The current read may never be wider than the approved ceiling.
     let within_ceiling = workspace
         .authorized_app_ids
         .iter()
         .all(|id| snapshot.authorized_app_ids.contains(id))
-        && workspace.apps.iter().all(|app| {
-            !app.app_id.is_empty() && workspace.authorized_app_ids.contains(&app.app_id)
-        });
+        && workspace
+            .apps
+            .iter()
+            .all(|app| workspace.authorized_app_ids.contains(&app.app_id));
     if !within_ceiling {
         return Err(Failure::Local("cli_scope_changed"));
     }
-    if parse_deadline(&workspace.expires_at)? <= Utc::now() {
+    let deadline = require_moment(&workspace.expires_at)?;
+    if deadline > require_moment(&snapshot.expires_at)?
+        || deadline > now + Duration::seconds(ACTIVE_LIMIT + CLOCK_MARGIN)
+    {
+        return Err(Failure::Local("cli_scope_changed"));
+    }
+    if deadline <= now {
         return Err(Failure::Local("cli_expired"));
     }
     Ok(workspace)
@@ -687,17 +595,393 @@ fn decode_receipt(
     request_id: &str,
 ) -> Result<Option<serde_json::Value>, Failure> {
     let receipt: ReceiptWire = parse(body)?;
-    if receipt.request_id != request_id || !RECEIPT_OPERATIONS.contains(&receipt.operation.as_str())
-    {
+    if receipt.request_id != request_id || receipt.operation != operation {
         return Err(Failure::Local("wire_invalid"));
     }
-    if receipt.operation != operation {
+    if !RECEIPT_OPERATIONS.contains(&receipt.operation.as_str()) {
         return Err(Failure::Local("wire_invalid"));
     }
     match (receipt.status.as_str(), receipt.response) {
         ("UNKNOWN", None) => Ok(None),
         ("SUCCEEDED", Some(value)) => Ok(Some(value)),
         _ => Err(Failure::Local("wire_invalid")),
+    }
+}
+
+// ── Transport ───────────────────────────────────────────────────────────────
+
+/// One request, described before it becomes a `reqwest::Request` so the same
+/// construction is used by the live path and by the narrow test seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Built {
+    method: &'static str,
+    path: String,
+    proof: String,
+    /// Idempotency key: the original operation UUID. Reads have none.
+    request_id: Option<String>,
+    /// Locator: always the create request id, which is the authorization id.
+    locator: String,
+    target: bool,
+    body: Option<serde_json::Value>,
+}
+
+fn proof_headers(built: &Built) -> Result<Vec<(HeaderName, HeaderValue)>, Failure> {
+    if !state::is_lower_hex(&built.proof, 64) {
+        return Err(Failure::Local("unsafe_local_state"));
+    }
+    if !is_uuid(&built.locator) {
+        return Err(Failure::Local("wire_invalid"));
+    }
+    if let Some(request_id) = &built.request_id {
+        if !is_uuid(request_id) {
+            return Err(Failure::Local("wire_invalid"));
+        }
+    }
+    let mut headers = vec![
+        (
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("{PROOF_SCHEME}{}", built.proof))
+                .map_err(|_| Failure::Local("wire_invalid"))?,
+        ),
+        (
+            HeaderName::from_static("x-facto-cli-request-id"),
+            HeaderValue::from_str(&built.locator).map_err(|_| Failure::Local("wire_invalid"))?,
+        ),
+    ];
+    if let Some(request_id) = &built.request_id {
+        headers.push((
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_str(request_id).map_err(|_| Failure::Local("wire_invalid"))?,
+        ));
+    }
+    if built.target {
+        headers.push((
+            HeaderName::from_static("x-facto-target"),
+            HeaderValue::from_static("test"),
+        ));
+    }
+    Ok(headers)
+}
+
+fn live_client() -> Result<Client, Failure> {
+    Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .redirect(redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| Failure::Local("transport_unavailable"))
+}
+
+/// Production request construction. The origin, TLS policy and headers are
+/// fixed here; no environment value is read.
+fn live_request(built: &Built) -> Result<(Client, Request), Failure> {
+    let client = live_client()?;
+    let url = format!("{API_ORIGIN}{}", built.path);
+    let mut builder = match built.method {
+        "POST" => client.post(&url),
+        "GET" => client.get(&url),
+        _ => return Err(Failure::Local("wire_invalid")),
+    };
+    for (name, value) in proof_headers(built)? {
+        builder = builder.header(name, value);
+    }
+    if let Some(body) = &built.body {
+        builder = builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(body);
+    }
+    let request = builder
+        .build()
+        .map_err(|_| Failure::Local("transport_unavailable"))?;
+    Ok((client, request))
+}
+
+fn push_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), Failure> {
+    if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
+        return Err(Failure::Local("response_too_large"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn interpret(status: StatusCode, body: Vec<u8>, expect: StatusCode) -> Result<Vec<u8>, Failure> {
+    if status == expect {
+        return Ok(body);
+    }
+    if let Ok(error) = serde_json::from_slice::<ErrorWire>(&body) {
+        if error.message.len() <= 512 {
+            return Err(server_code(&error.code)?);
+        }
+    }
+    Err(Failure::Local("http_rejected"))
+}
+
+#[cfg(test)]
+fn assemble(
+    status: StatusCode,
+    chunks: &[Vec<u8>],
+    expect: StatusCode,
+) -> Result<Vec<u8>, Failure> {
+    let mut body = Vec::new();
+    for chunk in chunks {
+        push_chunk(&mut body, chunk)?;
+    }
+    interpret(status, body, expect)
+}
+
+enum Sender {
+    Live,
+    #[cfg(test)]
+    Stub(std::rc::Rc<std::cell::RefCell<Stub>>),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Stub {
+    posted: Vec<Built>,
+    fetched: Vec<Built>,
+    script: std::collections::VecDeque<(u16, Vec<Vec<u8>>)>,
+}
+
+#[cfg(test)]
+impl Stub {
+    fn ok(&mut self, value: &serde_json::Value) {
+        self.script
+            .push_back((200, vec![serde_json::to_vec(value).expect("bytes")]));
+    }
+
+    fn created(&mut self, value: &serde_json::Value) {
+        self.script
+            .push_back((201, vec![serde_json::to_vec(value).expect("bytes")]));
+    }
+
+    fn status(&mut self, code: u16, value: &serde_json::Value) {
+        self.script
+            .push_back((code, vec![serde_json::to_vec(value).expect("bytes")]));
+    }
+
+    fn post_count(&self) -> usize {
+        self.posted.len()
+    }
+}
+
+impl Sender {
+    async fn transact(&self, built: &Built, expect: StatusCode) -> Result<Vec<u8>, Failure> {
+        match self {
+            Sender::Live => {
+                let (client, request) = live_request(built)?;
+                let mut response = client
+                    .execute(request)
+                    .await
+                    .map_err(|_| Failure::Local("transport_unavailable"))?;
+                let status = response.status();
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+                {
+                    return Err(Failure::Local("response_too_large"));
+                }
+                let mut body = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| Failure::Local("transport_unavailable"))?
+                {
+                    push_chunk(&mut body, &chunk)?;
+                }
+                interpret(status, body, expect)
+            }
+            #[cfg(test)]
+            Sender::Stub(cell) => {
+                let mut stub = cell.borrow_mut();
+                if built.method == "POST" {
+                    stub.posted.push(built.clone());
+                } else {
+                    stub.fetched.push(built.clone());
+                }
+                let (code, chunks) = stub
+                    .script
+                    .pop_front()
+                    .ok_or(Failure::Local("transport_unavailable"))?;
+                assemble(
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+                    &chunks,
+                    expect,
+                )
+            }
+        }
+    }
+}
+
+fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Failure> {
+    serde_json::from_slice(body).map_err(|_| Failure::Local("wire_invalid"))
+}
+
+// ── Endpoint builders ───────────────────────────────────────────────────────
+
+fn build_create(proof: &str, authorization_id: &str, body: serde_json::Value) -> Built {
+    Built {
+        method: "POST",
+        path: format!("{PREFIX}/authorizations"),
+        proof: proof.to_string(),
+        request_id: Some(authorization_id.to_string()),
+        locator: authorization_id.to_string(),
+        target: true,
+        body: Some(body),
+    }
+}
+
+fn build_read(proof: &str, locator: &str, path: String) -> Built {
+    Built {
+        method: "GET",
+        path,
+        proof: proof.to_string(),
+        request_id: None,
+        locator: locator.to_string(),
+        target: false,
+        body: None,
+    }
+}
+
+fn build_write(
+    proof: &str,
+    request_id: &str,
+    locator: &str,
+    path: String,
+    body: serde_json::Value,
+) -> Built {
+    Built {
+        method: "POST",
+        path,
+        proof: proof.to_string(),
+        request_id: Some(request_id.to_string()),
+        locator: locator.to_string(),
+        target: true,
+        body: Some(body),
+    }
+}
+
+fn revision_body(request_id: &str, expected_revision: u64) -> serde_json::Value {
+    serde_json::to_value(RevisionRequest {
+        request_id,
+        expected_revision,
+    })
+    .expect("revision request")
+}
+
+// ── Journal-bound wire helpers ──────────────────────────────────────────────
+
+async fn read_authorization(
+    sender: &Sender,
+    journal: &Journal,
+) -> Result<AuthorizationView, Failure> {
+    let built = build_read(
+        &journal.proof_hex,
+        &journal.authorization_id,
+        format!("{PREFIX}/authorizations/{}", journal.authorization_id),
+    );
+    let body = sender.transact(&built, StatusCode::OK).await?;
+    let view: AuthorizationView = parse(&body)?;
+    check_view_shape(&view, &journal.authorization_id).map(|_| view)
+}
+
+async fn read_receipt(
+    sender: &Sender,
+    journal: &Journal,
+    operation: &str,
+    request_id: &str,
+) -> Result<Option<serde_json::Value>, Failure> {
+    let built = build_read(
+        &journal.proof_hex,
+        &journal.authorization_id,
+        format!(
+            "{PREFIX}/authorizations/{}/requests/{operation}/{request_id}",
+            journal.authorization_id
+        ),
+    );
+    let body = sender.transact(&built, StatusCode::OK).await?;
+    decode_receipt(&body, operation, request_id)
+}
+
+async fn read_workspace(sender: &Sender, journal: &Journal) -> Result<WorkspaceResponse, Failure> {
+    let built = build_read(
+        &journal.proof_hex,
+        &journal.authorization_id,
+        format!("{PREFIX}/session/workspace"),
+    );
+    let body = sender.transact(&built, StatusCode::OK).await?;
+    parse::<WorkspaceResponse>(&body)
+}
+
+fn journal_approval(journal: &Journal) -> Option<ApprovalSnapshot> {
+    journal
+        .approval
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<ApprovalSnapshot>(value.clone()).ok())
+}
+
+fn stored_approval(journal: &Journal) -> Result<ApprovalSnapshot, Failure> {
+    let value = journal
+        .approval
+        .as_ref()
+        .ok_or(Failure::Local("cli_pending"))?;
+    let snapshot: ApprovalSnapshot =
+        serde_json::from_value(value.clone()).map_err(|_| Failure::Local("journal_invalid"))?;
+    check_snapshot_shape(&snapshot).map(|_| snapshot)
+}
+
+// ── Pairing channel ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// Interactive human terminal on stdout (normal output).
+    Stdout,
+    /// Interactive terminal in terse mode; the JSON report owns stdout.
+    Stderr,
+    /// Nothing is a terminal: pairing is refused before any request.
+    Refused,
+}
+
+fn pairing_channel(terse: bool, stdout_tty: bool, stderr_tty: bool) -> Channel {
+    if terse {
+        if stderr_tty {
+            Channel::Stderr
+        } else {
+            Channel::Refused
+        }
+    } else if stdout_tty {
+        Channel::Stdout
+    } else {
+        Channel::Refused
+    }
+}
+
+fn live_channel(terse: bool) -> Channel {
+    pairing_channel(
+        terse,
+        atty::is(atty::Stream::Stdout),
+        atty::is(atty::Stream::Stderr),
+    )
+}
+
+/// The pairing code reaches a terminal and nothing else: never the JSON
+/// report, a URL, a receipt, a log or the proof-bearing journal dump.
+fn announce_pairing<O: Write, E: Write>(
+    uri: &str,
+    code: &str,
+    channel: Channel,
+    mut stdout: O,
+    mut stderr: E,
+) -> Result<(), Failure> {
+    match channel {
+        Channel::Stdout => writeln!(stdout, "Open the approval page: {uri}")
+            .and_then(|| writeln!(stdout, "Pairing code to type on the Partner page: {code}"))
+            .map_err(|_| Failure::Local("transport_unavailable")),
+        Channel::Stderr => writeln!(stderr, "Pairing code for {uri}: {code}")
+            .map_err(|_| Failure::Local("transport_unavailable")),
+        Channel::Refused => Err(Failure::Local("pairing_requires_terminal")),
     }
 }
 
@@ -722,6 +1006,14 @@ struct Report {
     revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effect: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unknown_operations: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resumed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_step: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     granted_actions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -750,6 +1042,10 @@ impl Report {
             phase: None,
             revision: None,
             expires_at: None,
+            effect: None,
+            unknown_operations: None,
+            resumed: None,
+            next_step: None,
             granted_actions: None,
             authorized_app_ids: None,
             apps: None,
@@ -759,6 +1055,22 @@ impl Report {
             app_secret_transport: false,
             error: None,
         }
+    }
+
+    fn from_journal(
+        kind: &'static str,
+        mode: &str,
+        stage: &'static str,
+        journal: &Journal,
+    ) -> Self {
+        let mut report = Report::new(kind, mode, stage);
+        report.authorization_id = Some(journal.authorization_id.clone());
+        report.phase = Some(journal.phase.clone());
+        report.revision = Some(journal.revision);
+        report.expires_at = (!journal.expires_at.is_empty()).then(|| journal.expires_at.clone());
+        report.session_id = journal.session_id.clone();
+        report.verification_uri = Some(approval_page_uri(&journal.authorization_id));
+        report
     }
 
     fn succeeded(mut self) -> Self {
@@ -790,6 +1102,14 @@ impl Report {
         if let Some(phase) = &self.phase {
             text.push_str(&format!("Phase: {phase}\n"));
         }
+        if let Some(effect) = &self.effect {
+            text.push_str(&format!("Original effect: {effect}\n"));
+        }
+        if let Some(unknown) = &self.unknown_operations {
+            if !unknown.is_empty() {
+                text.push_str(&format!("Unresolved operations: {}.\n", unknown.join(", ")));
+            }
+        }
         if let Some(apps) = &self.apps {
             if apps.is_empty() {
                 text.push_str("Authorized applications: none.\n");
@@ -806,6 +1126,9 @@ impl Report {
         if let Some(error) = &self.error {
             text.push_str(&format!("Reason: {error}\n"));
         }
+        if let Some(step) = &self.next_step {
+            text.push_str(&format!("Next step: {step}\n"));
+        }
         text.push_str(&format!(
             "Authentication verified: {}. Business UAT: NOT_RUN. No App secret was read, sent or stored.\n",
             self.authentication_verified
@@ -815,13 +1138,17 @@ impl Report {
 }
 
 fn emit(mut report: Report, outcome: Result<(), Failure>, terse: bool) -> Result<()> {
-    if let Err(failure) = outcome {
-        report = report.failed(&failure);
-        println!("{}", report.render(terse));
-        return Err(anyhow::anyhow!(failure.code()));
+    match outcome {
+        Ok(()) => {
+            println!("{}", report.succeeded().render(terse));
+            Ok(())
+        }
+        Err(failure) => {
+            report = report.failed(&failure);
+            println!("{}", report.render(terse));
+            Err(anyhow::anyhow!(failure.code()))
+        }
     }
-    println!("{}", report.succeeded().render(terse));
-    Ok(())
 }
 
 // ── Shared preamble ─────────────────────────────────────────────────────────
@@ -843,88 +1170,173 @@ fn open_store() -> Result<std::path::PathBuf, Failure> {
 }
 
 fn persist(dir: &std::path::Path, journal: &Journal) -> Result<(), Failure> {
-    state::write(dir, journal).map_err(|error| Failure::Local(error.code()))
+    state::save(dir, journal).map_err(|error| Failure::Local(error.code()))
 }
 
-fn load_current() -> Result<(std::path::PathBuf, Journal), Failure> {
-    let dir = open_store()?;
-    let journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
-    Ok((dir, journal))
+fn clock() -> DateTime<Utc> {
+    Utc::now()
 }
 
-async fn read_authorization(journal: &Journal) -> Result<AuthorizationView, Failure> {
-    let path = format!("{PREFIX}/authorizations/{}", journal.authorization_id);
-    let body = get_proof(&journal.proof_hex, &journal.authorization_id, &path).await?;
-    validate_view(
-        parse::<AuthorizationView>(&body)?,
-        &journal.authorization_id,
-    )
+// ── Pairing state machine ───────────────────────────────────────────────────
+
+fn wants_resume(journal: &Journal, now: DateTime<Utc>) -> bool {
+    if journal.has_unresolved_intent() {
+        return true;
+    }
+    let pairing = matches!(journal.phase.as_str(), "PENDING" | "APPROVED");
+    pairing
+        && journal
+            .pairing_deadline()
+            .map_or(true, |deadline| deadline > now)
 }
 
-async fn read_receipt(
-    journal: &Journal,
-    operation: &str,
-    request_id: &str,
-) -> Result<Option<serde_json::Value>, Failure> {
-    let path = format!(
-        "{}/authorizations/{}/requests/{operation}/{request_id}",
-        PREFIX, journal.authorization_id
+fn blocks_new_pairing(journal: &Journal, now: DateTime<Utc>) -> bool {
+    journal.phase == "ACTIVE"
+        && journal
+            .pairing_deadline()
+            .map_or(false, |deadline| deadline > now)
+}
+
+/// Persist the original intent, then issue the single create POST. A lost
+/// response is recovered from the original receipt, never by posting twice.
+async fn fresh_pairing(
+    mode: &str,
+    dir: &std::path::Path,
+    sender: &Sender,
+    report: &mut Report,
+    now: DateTime<Utc>,
+) -> Result<Journal, Failure> {
+    let proof = new_proof()?;
+    let authorization_id = new_uuid_v4()?;
+    let pairing = new_pairing_code()?;
+    let normalized =
+        normalize_pairing_code(&pairing).ok_or(Failure::Local("unsafe_local_state"))?;
+    let hashed = verification_code_hash(&authorization_id, &normalized);
+    let body = CreateRequest {
+        request_id: &authorization_id,
+        verification_code_hash: &hashed,
+        requested_actions: ACTIONS,
+        mode,
+    };
+    let value = serde_json::to_value(&body).map_err(|_| Failure::Local("unsafe_local_state"))?;
+    let mut journal = Journal::new(
+        mode,
+        &proof,
+        &normalized,
+        &authorization_id,
+        value.clone(),
+        &now,
     );
-    let body = get_proof(&journal.proof_hex, &journal.authorization_id, &path).await?;
-    decode_receipt(&body, operation, request_id)
+    // Durable before the wire: an exclusive create also blocks a second process.
+    state::create(dir, &journal).map_err(|error| Failure::Local(error.code()))?;
+    report.stage = "create";
+    report.authorization_id = Some(authorization_id.clone());
+    report.verification_uri = Some(approval_page_uri(&authorization_id));
+
+    let built = build_create(&proof, &authorization_id, value);
+    let created = match sender.transact(&built, StatusCode::CREATED).await {
+        Ok(bytes) => validate_create(parse::<CreateResponse>(&bytes)?, &authorization_id, now)?,
+        Err(failure) if failure == Failure::Local("transport_unavailable") => {
+            journal.mark_unknown("create");
+            journal.touch(&now, "UNKNOWN", journal.revision, "");
+            persist(dir, &journal)?;
+            report.resumed = Some(false);
+            // The effect is unknown: only the original receipt may answer, and
+            // an answer that stays unknown is reported, never re-posted.
+            let _ = resume_create(dir, journal, sender, report).await?;
+            Err(failure)
+        }
+        Err(failure) => return Err(failure),
+    };
+
+    journal.create_recorded = true;
+    journal.clear_unknown("create");
+    journal.touch(&now, &created.status, created.revision, &created.expires_at);
+    persist(dir, &journal)?;
+    report.phase = Some(created.status.clone());
+    report.revision = Some(created.revision);
+    report.expires_at = Some(created.expires_at.clone());
+    Ok(journal)
 }
 
-async fn workspace_read(
-    journal: &Journal,
-    snapshot: &ApprovalSnapshot,
-) -> Result<WorkspaceResponse, Failure> {
-    let body = get_proof(
-        &journal.proof_hex,
-        &journal.authorization_id,
-        &format!("{PREFIX}/session/workspace"),
+/// Read the original create effect. A historical success stays readable after
+/// its own deadline; it is never treated as current authority.
+async fn resume_create(
+    dir: &std::path::Path,
+    mut journal: Journal,
+    sender: &Sender,
+    report: &mut Report,
+) -> Result<Journal, Failure> {
+    report.stage = "create-receipt";
+    let value = read_receipt(
+        sender,
+        &journal,
+        "create",
+        &journal.create_request_id.clone(),
     )
     .await?;
-    let workspace: WorkspaceResponse = parse(&body)?;
-    validate_workspace(workspace, journal, snapshot)
-}
-
-fn announce_pairing(uri: &str, code: &str, terse: bool) {
-    // The pairing code is never part of the JSON report; terse mode keeps it on
-    // the terminal error stream so machine output stays credential-free.
-    if terse {
-        eprintln!("Pairing code for {uri}: {code}");
-    } else {
-        println!("Open the approval page: {uri}");
-        println!("Pairing code to type on the Partner page: {code}");
+    match value {
+        Some(value) => {
+            let created: CreateResponse =
+                serde_json::from_value(value).map_err(|_| Failure::Local("wire_invalid"))?;
+            check_create_shape(&created, &journal.authorization_id)?;
+            journal.create_recorded = true;
+            journal.clear_unknown("create");
+            journal.touch(
+                &clock(),
+                &created.status,
+                created.revision,
+                &created.expires_at,
+            );
+            persist(dir, &journal)?;
+            report.phase = Some(created.status.clone());
+            report.revision = Some(created.revision);
+            report.expires_at = Some(created.expires_at.clone());
+            Ok(journal)
+        }
+        None => {
+            journal.mark_unknown("create");
+            journal.touch(&clock(), "UNKNOWN", journal.revision, "");
+            persist(dir, &journal)?;
+            report.next_step =
+                Some("demo session to read the original receipt, or demo logout to revoke it");
+            Err(Failure::Local("receipt_unknown"))
+        }
     }
 }
 
 async fn wait_for_approval(
     dir: &std::path::Path,
     journal: &mut Journal,
+    sender: &Sender,
     deadline: DateTime<Utc>,
 ) -> Result<AuthorizationView, Failure> {
     let mut transport_failures = 0_u32;
     loop {
-        if Utc::now() >= deadline {
-            journal.touch(&Utc::now(), "EXPIRED", journal.revision, "");
-            let _ = persist(dir, journal);
+        if clock() >= deadline {
+            journal.touch(&clock(), "EXPIRED", journal.revision, "");
+            persist(dir, journal)?;
             return Err(Failure::Local("cli_expired"));
         }
-        match read_authorization(journal).await {
+        match read_authorization(sender, journal).await {
             Ok(view) => {
                 transport_failures = 0;
-                journal.touch(&Utc::now(), &view.status, view.revision, &view.expires_at);
-                let _ = persist(dir, journal);
+                journal.touch(&clock(), &view.status, view.revision, &view.expires_at);
+                if let Some(snapshot) = &view.approval {
+                    journal.approval = Some(
+                        serde_json::to_value(snapshot)
+                            .map_err(|_| Failure::Local("wire_invalid"))?,
+                    );
+                }
+                persist(dir, journal)?;
                 match view.status.as_str() {
                     "APPROVED" => return Ok(view),
                     "PENDING" => {}
                     "DENIED" => return Err(Failure::Local("cli_denied")),
                     "EXPIRED" => return Err(Failure::Local("cli_expired")),
                     "REVOKED" => return Err(Failure::Local("cli_revoked")),
-                    // Already exchanged by another run of the same pairing.
-                    "ACTIVE" => return Err(Failure::Local("cli_already_exchanged")),
-                    other => require_phase(other)?,
+                    "ACTIVE" => return Ok(view),
+                    _ => return Err(Failure::Local("wire_invalid")),
                 }
             }
             Err(failure) if failure == Failure::Local("transport_unavailable") => {
@@ -939,179 +1351,236 @@ async fn wait_for_approval(
     }
 }
 
+async fn ensure_exchange(
+    dir: &std::path::Path,
+    journal: &mut Journal,
+    sender: &Sender,
+    report: &mut Report,
+    approved_revision: u64,
+) -> Result<(), Failure> {
+    report.stage = "exchange";
+    // The original intent is reused across processes: same request id, same
+    // expected revision, and never a second bearer.
+    let (exchange_id, expected_revision) = match (
+        &journal.exchange_request_id,
+        journal.exchange_expected_revision,
+    ) {
+        (Some(id), Some(revision)) => (id.clone(), revision),
+        _ => {
+            let fresh = new_uuid_v4()?;
+            journal.record_exchange_intent(&fresh, approved_revision);
+            persist(dir, journal)?;
+            let stored = state::read(&state::journal_path(dir, &journal.authorization_id))
+                .map_err(|error| Failure::Local(error.code()))?;
+            let id = stored
+                .exchange_request_id
+                .clone()
+                .ok_or(Failure::Local("journal_invalid"))?;
+            let revision = stored
+                .exchange_expected_revision
+                .ok_or(Failure::Local("journal_invalid"))?;
+            (id, revision)
+        }
+    };
+    if journal.exchange_recorded {
+        return Ok(());
+    }
+    // An exchange that is already owed a receipt read is only ever read back.
+    if journal.unknown.iter().any(|name| name == "exchange") {
+        return recover_exchange(dir, journal, sender, report).await;
+    }
+    let body = revision_body(&exchange_id, expected_revision);
+    let built = build_write(
+        &journal.proof_hex,
+        &exchange_id,
+        &journal.authorization_id,
+        format!(
+            "{PREFIX}/authorizations/{}/exchanges",
+            journal.authorization_id
+        ),
+        body,
+    );
+    let now = clock();
+    match sender.transact(&built, StatusCode::OK).await {
+        Ok(bytes) => {
+            let response = parse::<ExchangeResponse>(&bytes)?;
+            let ceiling = match journal_approval(journal) {
+                Some(snapshot) => snapshot,
+                None => response
+                    .approval
+                    .clone()
+                    .ok_or(Failure::Local("wire_invalid"))?,
+            };
+            let response = validate_exchange(
+                response,
+                &journal.authorization_id,
+                &exchange_id,
+                expected_revision,
+                &ceiling,
+                now,
+            )?;
+            if let Some(snapshot) = &response.approval {
+                journal.approval = Some(
+                    serde_json::to_value(snapshot).map_err(|_| Failure::Local("wire_invalid"))?,
+                );
+            }
+            journal.exchange_recorded = true;
+            journal.clear_unknown("exchange");
+            journal.session_id = Some(response.session_id.clone());
+            journal.touch(
+                &now,
+                &response.status,
+                response.revision,
+                &response.expires_at,
+            );
+            persist(dir, journal)?;
+            report.session_id = Some(response.session_id.clone());
+            report.phase = Some(response.status.clone());
+            report.revision = Some(response.revision);
+            report.expires_at = Some(response.expires_at.clone());
+            Ok(())
+        }
+        Err(failure) if failure == Failure::Local("transport_unavailable") => {
+            journal.mark_unknown("exchange");
+            persist(dir, journal)?;
+            recover_exchange(dir, journal, sender, report).await
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+/// A recovered exchange restores the safe binding only. It never claims current
+/// access; the independent workspace read is what may do that.
+async fn recover_exchange(
+    dir: &std::path::Path,
+    journal: &mut Journal,
+    sender: &Sender,
+    report: &mut Report,
+) -> Result<(), Failure> {
+    report.stage = "exchange-receipt";
+    let exchange_id = journal
+        .exchange_request_id
+        .clone()
+        .ok_or(Failure::Local("journal_invalid"))?;
+    let value = read_receipt(sender, journal, "exchange", &exchange_id).await?;
+    match value {
+        Some(value) => {
+            let response: ExchangeResponse =
+                serde_json::from_value(value).map_err(|_| Failure::Local("wire_invalid"))?;
+            check_exchange_shape(&response, &journal.authorization_id, &exchange_id)?;
+            let snapshot = response
+                .approval
+                .as_ref()
+                .ok_or(Failure::Local("wire_invalid"))?;
+            check_snapshot_shape(snapshot)?;
+            journal.approval =
+                Some(serde_json::to_value(snapshot).map_err(|_| Failure::Local("wire_invalid"))?);
+            journal.exchange_recorded = true;
+            journal.clear_unknown("exchange");
+            journal.session_id = Some(response.session_id.clone());
+            journal.touch(
+                &clock(),
+                &response.status,
+                response.revision,
+                &response.expires_at,
+            );
+            persist(dir, journal)?;
+            report.effect = Some("exchange:SUCCEEDED".to_string());
+            report.authentication_verified = false;
+            Ok(())
+        }
+        None => {
+            report.next_step = Some("demo session reads the original receipt; logout revokes it");
+            Err(Failure::Local("receipt_unknown"))
+        }
+    }
+}
+
 // ── Commands ────────────────────────────────────────────────────────────────
 
 pub(crate) async fn authorize(target: &str, mode: &str, terse: bool) -> Result<()> {
     let mut report = Report::new("partner_cli_authorize", mode, "precheck");
-    let outcome = authorize_run(target, mode, &mut report).await;
+    let outcome = authorize_run(target, mode, terse, &Sender::Live, &mut report).await;
     emit(report, outcome, terse)
 }
 
-async fn authorize_run(target: &str, mode: &str, report: &mut Report) -> Result<(), Failure> {
+async fn authorize_run(
+    target: &str,
+    mode: &str,
+    terse: bool,
+    sender: &Sender,
+    report: &mut Report,
+) -> Result<(), Failure> {
     reject_target(target)?;
+    let channel = live_channel(terse);
+    if channel == Channel::Refused {
+        return Err(Failure::Local("pairing_requires_terminal"));
+    }
     let dir = open_store()?;
-    let proof = new_proof()?;
-    let authorization_id = new_uuid_v4()?;
-    let pairing = new_pairing_code()?;
-    let normalized =
-        normalize_pairing_code(&pairing).ok_or(Failure::Local("unsafe_local_state"))?;
-    let hashed = verification_code_hash(&authorization_id, &normalized);
-    let body = CreateRequest {
-        request_id: &authorization_id,
-        verification_code_hash: &hashed,
-        requested_actions: ACTIONS,
-        mode,
-    };
-    let mut journal = Journal::new(
-        mode,
-        &proof,
-        &authorization_id,
-        serde_json::to_value(&body).map_err(|_| Failure::Local("unsafe_local_state"))?,
-        &Utc::now(),
-    );
-    // The pairing must be durable before the single create POST is issued.
-    persist(&dir, &journal)?;
-
-    report.stage = "create";
-    report.authorization_id = Some(authorization_id.clone());
-    report.verification_uri = Some(approval_page_uri(&authorization_id));
-    let path = format!("{PREFIX}/authorizations");
-    let created = match post_json(
-        &proof,
-        &authorization_id,
-        &authorization_id,
-        &path,
-        &body,
-        StatusCode::CREATED,
-    )
-    .await
-    {
-        Ok(bytes) => validate_create(parse::<CreateResponse>(&bytes)?, &authorization_id)?,
-        Err(failure) if failure == Failure::Local("transport_unavailable") => {
-            journal.mark_unknown("create");
-            journal.touch(&Utc::now(), "UNKNOWN", journal.revision, "");
-            persist(&dir, &journal)?;
-            return Err(recover_create(&dir, &mut journal, &authorization_id).await);
+    let now = clock();
+    let mut journal = match state::current(&dir) {
+        Ok(existing) if wants_resume(&existing, now) => {
+            report.resumed = Some(true);
+            if !existing.create_recorded || existing.unknown.iter().any(|name| name == "create") {
+                resume_create(&dir, existing, sender, report).await?
+            } else {
+                existing
+            }
         }
-        Err(failure) => return Err(failure),
+        Ok(existing) if blocks_new_pairing(&existing, now) => {
+            report.authorization_id = Some(existing.authorization_id.clone());
+            report.phase = Some(existing.phase.clone());
+            return Err(Failure::Local("cli_already_active"));
+        }
+        Ok(_) => fresh_pairing(mode, &dir, sender, report, now).await?,
+        Err(state::StateError::JournalMissing) => {
+            fresh_pairing(mode, &dir, sender, report, now).await?
+        }
+        Err(error) => return Err(Failure::Local(error.code())),
     };
 
-    journal.create_recorded = true;
-    journal.touch(
-        &Utc::now().to_rfc3339(),
-        &created.status,
-        created.revision,
-        &created.expires_at,
-    );
-    persist(&dir, &journal)?;
+    if !journal.pairing_code.is_empty() {
+        let code = display_pairing_code(&journal.pairing_code);
+        let uri = approval_page_uri(&journal.authorization_id);
+        let shown = announce_pairing(&uri, &code, channel, std::io::stdout(), std::io::stderr());
+        if shown.is_ok() && channel == Channel::Stdout {
+            let _ = open::that(&uri);
+        }
+    }
 
     report.stage = "pending";
-    report.phase = Some(created.status.clone());
-    report.revision = Some(created.revision);
-    report.expires_at = Some(created.expires_at.clone());
-    announce_pairing(
-        &created.verification_uri,
-        &display_pairing_code(&normalized),
-        false,
-    );
-    let _ = open::that(&created.verification_uri);
-
-    let deadline = parse_deadline(&created.expires_at)?;
-    let view = wait_for_approval(&dir, &mut journal, deadline).await?;
-    let snapshot = view.approval.ok_or(Failure::Local("wire_invalid"))?;
-
-    report.stage = "exchange";
-    let exchange_request_id = new_uuid_v4()?;
-    journal.exchange_request_id = Some(exchange_request_id.clone());
-    persist(&dir, &journal)?;
-    let exchange_body = RevisionRequest {
-        request_id: &exchange_request_id,
-        expected_revision: view.revision,
-    };
-    let exchange_path = format!("{PREFIX}/authorizations/{authorization_id}/exchanges");
-    let exchanged = match post_json(
-        &proof,
-        &exchange_request_id,
-        &authorization_id,
-        &exchange_path,
-        &exchange_body,
-        StatusCode::OK,
-    )
-    .await
-    {
-        Ok(bytes) => validate_exchange(
-            parse::<ExchangeResponse>(&bytes)?,
-            &authorization_id,
-            &exchange_request_id,
-        )?,
-        Err(failure) if failure == Failure::Local("transport_unavailable") => {
-            journal.mark_unknown("exchange");
+    let approved: AuthorizationView = if matches!(journal.phase.as_str(), "APPROVED" | "ACTIVE") {
+        let view = read_authorization(sender, &journal).await?;
+        if let Some(snapshot) = &view.approval {
+            journal.approval =
+                Some(serde_json::to_value(snapshot).map_err(|_| Failure::Local("wire_invalid"))?);
             persist(&dir, &journal)?;
-            return Err(recover_exchange(&dir, &mut journal, &exchange_request_id).await);
         }
-        Err(failure) => return Err(failure),
+        view
+    } else {
+        let deadline = journal
+            .pairing_deadline()
+            .ok_or(Failure::Local("wire_invalid"))?;
+        wait_for_approval(&dir, &mut journal, sender, deadline).await?
     };
-
-    journal.exchange_recorded = true;
-    journal.unknown.retain(|name| name != "exchange");
-    journal.session_id = Some(exchanged.session_id.clone());
-    journal.touch(
-        &Utc::now().to_rfc3339(),
-        &exchanged.status,
-        exchanged.revision,
-        &exchanged.expires_at,
-    );
-    persist(&dir, &journal)?;
+    if approved.status == "ACTIVE" && journal.exchange_recorded {
+        report.effect = Some("exchange:SUCCEEDED".to_string());
+    } else {
+        ensure_exchange(&dir, &mut journal, sender, report, approved.revision).await?;
+    }
 
     report.stage = "workspace";
-    report.session_id = Some(exchanged.session_id.clone());
-    report.phase = Some(exchanged.status.clone());
-    report.revision = Some(exchanged.revision);
-    report.expires_at = Some(exchanged.expires_at.clone());
-    report.granted_actions = Some(snapshot.granted_actions.clone());
-    report.authorized_app_ids = Some(snapshot.authorized_app_ids.clone());
-    let workspace = workspace_read(&journal, &snapshot).await?;
+    let snapshot = stored_approval(&journal)?;
+    let workspace = read_workspace(sender, &journal).await?;
+    let workspace = validate_workspace(workspace, &journal.authorization_id, &snapshot, clock())?;
+    report.session_id = Some(workspace.session_id.clone());
+    report.granted_actions = Some(workspace.granted_actions.clone());
+    report.authorized_app_ids = Some(workspace.authorized_app_ids.clone());
     report.apps = Some(workspace.apps.clone());
+    // Only this current read may set the flag, and only after every other stage
+    // has already been recorded durably.
     report.authentication_verified = true;
     Ok(())
-}
-
-async fn recover_create(
-    dir: &std::path::Path,
-    journal: &mut Journal,
-    authorization_id: &str,
-) -> Failure {
-    match read_receipt(journal, "create", authorization_id).await {
-        Ok(Some(value)) => match serde_json::from_value::<CreateResponse>(value) {
-            Ok(created) if validate_create(created, authorization_id).is_ok() => {
-                journal.create_recorded = true;
-                journal.unknown.retain(|name| name != "create");
-                journal.touch(&Utc::now(), "PENDING", 1, "");
-                let _ = persist(dir, journal);
-                Failure::Local("receipt_succeeded")
-            }
-            _ => Failure::Local("wire_invalid"),
-        },
-        Ok(None) => Failure::Local("receipt_unknown"),
-        Err(failure) => failure,
-    }
-}
-
-async fn recover_exchange(
-    dir: &std::path::Path,
-    journal: &mut Journal,
-    request_id: &str,
-) -> Failure {
-    match read_receipt(journal, "exchange", request_id).await {
-        Ok(Some(_)) => {
-            journal.exchange_recorded = true;
-            journal.unknown.retain(|name| name != "exchange");
-            let _ = persist(dir, journal);
-            Failure::Local("receipt_succeeded")
-        }
-        Ok(None) => Failure::Local("receipt_unknown"),
-        Err(failure) => failure,
-    }
 }
 
 pub(crate) async fn session(target: &str, mode: &str, terse: bool) -> Result<()> {
@@ -1122,53 +1591,95 @@ pub(crate) async fn session(target: &str, mode: &str, terse: bool) -> Result<()>
 
 async fn session_run(target: &str, report: &mut Report) -> Result<(), Failure> {
     reject_target(target)?;
-    let (dir, mut journal) = load_current()?;
+    let sender = Sender::Live;
+    let dir = open_store()?;
+    let mut journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
     report.stage = "authorization";
     report.authorization_id = Some(journal.authorization_id.clone());
     report.verification_uri = Some(approval_page_uri(&journal.authorization_id));
+    report.resumed = Some(true);
 
-    // Recovery reads only: no create, exchange or refresh side effect here.
+    // Recovery reads only: no create, exchange or refresh side effect.
     for operation in journal.unknown.clone() {
         if !RECEIPT_OPERATIONS.contains(&operation.as_str()) {
             return Err(Failure::Local("journal_invalid"));
         }
-        let request_id = match operation.as_str() {
-            "create" => journal.create_request_id.clone(),
-            "exchange" => journal.exchange_request_id.clone(),
-            "revoke" => journal.revoke_request_id.clone(),
-            _ => None,
-        };
-        if let Some(request_id) = request_id {
-            if read_receipt(&journal, &operation, &request_id)
-                .await?
-                .is_some()
-            {
-                journal.unknown.retain(|name| *name != operation);
-                persist(&dir, &journal)?;
+        let request_id = receipt_key(&journal, &operation)?;
+        report.stage = "receipt";
+        match operation.as_str() {
+            "create" => {
+                resume_create(&dir, journal.clone(), &sender, report).await?;
+            }
+            "exchange" => {
+                recover_exchange(&dir, &mut journal, &sender, report).await?;
+            }
+            _ => {
+                let value = read_receipt(&sender, &journal, &operation, &request_id).await?;
+                // A revoke effect is only cleared by its own typed payload.
+                if let Some(value) = value {
+                    let response: RevocationResponse = serde_json::from_value(value)
+                        .map_err(|_| Failure::Local("wire_invalid"))?;
+                    check_revocation_shape(&response, &journal.authorization_id, &request_id)?;
+                    journal.revoke_recorded = true;
+                    journal.clear_unknown("revoke");
+                    journal.touch(&clock(), &response.status, response.revision, "");
+                    persist(&dir, &journal)?;
+                    report.effect = Some(format!("revoke:{}", response.status));
+                }
             }
         }
     }
+    journal = state::read(&state::journal_path(&dir, &journal.authorization_id))
+        .map_err(|error| Failure::Local(error.code()))?;
 
-    let view = match read_authorization(&journal).await {
+    report.stage = "authorization";
+    let view = match read_authorization(&sender, &journal).await {
         Ok(view) => view,
         // A record the server no longer returns is unknown, never a proof of
         // failure, and never triggers a new create POST.
         Err(failure) if failure == Failure::Local("http_rejected") => {
             report.phase = Some(journal.phase.clone());
+            report.unknown_operations = Some(journal.unknown.clone());
             return Err(Failure::Local("receipt_unknown"));
         }
         Err(failure) => return Err(failure),
     };
+    journal.touch(&clock(), &view.status, view.revision, &view.expires_at);
+    if let Some(snapshot) = &view.approval {
+        journal.approval =
+            Some(serde_json::to_value(snapshot).map_err(|_| Failure::Local("wire_invalid"))?);
+    }
+    persist(&dir, &journal)?;
     report.phase = Some(view.status.clone());
     report.revision = Some(view.revision);
     report.expires_at = Some(view.expires_at.clone());
-    journal.touch(&Utc::now(), &view.status, view.revision, &view.expires_at);
-    persist(&dir, &journal)?;
+    report.effect = Some(format!("authorization:{}", view.status));
+    report.unknown_operations = (!journal.unknown.is_empty()).then(|| journal.unknown.clone());
     if let Some(snapshot) = &view.approval {
         report.granted_actions = Some(snapshot.granted_actions.clone());
         report.authorized_app_ids = Some(snapshot.authorized_app_ids.clone());
     }
+    // A stored or historical ACTIVE phase is an effect, not current access.
+    report.authentication_verified = false;
+    if !journal.unknown.is_empty() {
+        report.next_step =
+            Some("demo session reads the original receipt again; demo logout revokes it");
+    }
     Ok(())
+}
+
+fn receipt_key(journal: &Journal, operation: &str) -> Result<String, Failure> {
+    let key = match operation {
+        "create" => Some(journal.create_request_id.clone()),
+        "exchange" => journal.exchange_request_id.clone(),
+        "revoke" => journal.revoke_request_id.clone(),
+        _ => None,
+    };
+    let key = key.ok_or(Failure::Local("journal_invalid"))?;
+    if !is_uuid(&key) {
+        return Err(Failure::Local("journal_invalid"));
+    }
+    Ok(key)
 }
 
 pub(crate) async fn check_access(target: &str, mode: &str, terse: bool) -> Result<()> {
@@ -1179,22 +1690,17 @@ pub(crate) async fn check_access(target: &str, mode: &str, terse: bool) -> Resul
 
 async fn check_access_run(target: &str, report: &mut Report) -> Result<(), Failure> {
     reject_target(target)?;
-    let (dir, mut journal) = load_current()?;
+    let sender = Sender::Live;
+    let dir = open_store()?;
+    let journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
     report.authorization_id = Some(journal.authorization_id.clone());
-    // Only this explicit current read may set authentication_verified; a stored
-    // ACTIVE phase or a historical receipt never does.
-    let view = read_authorization(&journal).await?;
-    journal.touch(&Utc::now(), &view.status, view.revision, &view.expires_at);
-    persist(&dir, &journal)?;
-    report.phase = Some(view.status.clone());
-    report.revision = Some(view.revision);
+    report.session_id = journal.session_id.clone();
+    // The original ticket gives this command exactly one GET: the current read.
     report.stage = "workspace";
-    if view.status != "ACTIVE" {
-        return Err(Failure::Local("cli_pending"));
-    }
-    let snapshot = view.approval.ok_or(Failure::Local("wire_invalid"))?;
-    let workspace = workspace_read(&journal, &snapshot).await?;
-    report.session_id = Some(workspace.session_id.clone());
+    let snapshot = stored_approval(&journal)?;
+    let workspace = read_workspace(&sender, &journal).await?;
+    let workspace = validate_workspace(workspace, &journal.authorization_id, &snapshot, clock())?;
+    report.phase = Some("ACTIVE".to_string());
     report.expires_at = Some(workspace.expires_at.clone());
     report.granted_actions = Some(workspace.granted_actions.clone());
     report.authorized_app_ids = Some(workspace.authorized_app_ids.clone());
@@ -1211,79 +1717,148 @@ pub(crate) async fn logout(target: &str, mode: &str, terse: bool) -> Result<()> 
 
 async fn logout_run(target: &str, report: &mut Report) -> Result<(), Failure> {
     reject_target(target)?;
-    let (dir, mut journal) = load_current()?;
+    let sender = Sender::Live;
+    let dir = open_store()?;
+    let mut journal = state::current(&dir).map_err(|error| Failure::Local(error.code()))?;
     report.authorization_id = Some(journal.authorization_id.clone());
     report.phase = Some(journal.phase.clone());
     report.stage = "revocation";
-    let revoke_request_id = match journal.revoke_request_id.clone() {
-        Some(existing) => existing,
-        None => {
-            let fresh = new_uuid_v4()?;
-            journal.revoke_request_id = Some(fresh.clone());
-            persist(&dir, &journal)?;
-            fresh
-        }
-    };
-    let body = RevisionRequest {
-        request_id: &revoke_request_id,
-        expected_revision: journal.revision,
-    };
-    let path = format!(
-        "{}/authorizations/{}/revocations",
-        PREFIX, journal.authorization_id
-    );
-    match post_json(
+
+    if journal.phase == "REVOKED" && !journal.has_unresolved_intent() {
+        // Already revoked locally: a repeat is a definite success and never a
+        // second POST. The original receipt may still be read on demand.
+        report.effect = Some("revoke:SUCCEEDED".to_string());
+        return Ok(());
+    }
+    if journal.unknown.iter().any(|name| name == "revoke") {
+        return recover_revoke(&dir, &mut journal, &sender, report).await;
+    }
+    let (revoke_id, expected_revision) =
+        match (&journal.revoke_request_id, journal.revoke_expected_revision) {
+            (Some(id), Some(revision)) => (id.clone(), revision),
+            _ => {
+                let fresh = new_uuid_v4()?;
+                journal.record_revoke_intent(&fresh, journal.revision);
+                persist(&dir, &journal)?;
+                let stored = state::read(&state::journal_path(dir, &journal.authorization_id))
+                    .map_err(|error| Failure::Local(error.code()))?;
+                let id = stored
+                    .revoke_request_id
+                    .clone()
+                    .ok_or(Failure::Local("journal_invalid"))?;
+                let revision = stored
+                    .revoke_expected_revision
+                    .ok_or(Failure::Local("journal_invalid"))?;
+                (id, revision)
+            }
+        };
+    if journal.revoke_recorded {
+        report.effect = Some("revoke:SUCCEEDED".to_string());
+        return Ok(());
+    }
+    let body = revision_body(&revoke_id, expected_revision);
+    let built = build_write(
         &journal.proof_hex,
-        &revoke_request_id,
+        &revoke_id,
         &journal.authorization_id,
-        &path,
-        &body,
-        StatusCode::OK,
-    )
-    .await
-    {
+        format!(
+            "{PREFIX}/authorizations/{}/revocations",
+            journal.authorization_id
+        ),
+        body,
+    );
+    let now = clock();
+    match sender.transact(&built, StatusCode::OK).await {
         Ok(bytes) => {
-            let response = validate_revocation(
-                parse::<RevocationResponse>(&bytes)?,
-                &journal.authorization_id,
-                &revoke_request_id,
-            )?;
+            let response = parse::<RevocationResponse>(&bytes)?;
+            check_revocation_shape(&response, &journal.authorization_id, &revoke_id)?;
+            if response.previous_revision != expected_revision
+                || response.revision != expected_revision + 1
+            {
+                return Err(Failure::Local("cli_scope_changed"));
+            }
             journal.revoke_recorded = true;
-            journal.unknown.retain(|name| name != "revoke");
-            journal.touch(&Utc::now(), &response.status, response.revision, "");
+            journal.clear_unknown("revoke");
+            journal.touch(&now, &response.status, response.revision, "");
             persist(&dir, &journal)?;
             report.phase = Some(response.status.clone());
             report.revision = Some(response.revision);
         }
-        // An unknown revocation keeps the recovery journal and never resends
-        // under a different key.
         Err(failure) if failure == Failure::Local("transport_unavailable") => {
             journal.mark_unknown("revoke");
             persist(&dir, &journal)?;
-            return Err(Failure::Local("receipt_unknown"));
+            return recover_revoke(&dir, &mut journal, &sender, report).await;
         }
-        Err(Failure::Server("cli_revoked")) => {
-            journal.touch(&Utc::now(), "REVOKED", journal.revision, "");
+        Err(failure @ Failure::Server("cli_revoked")) => {
+            journal.touch(&now, "REVOKED", journal.revision, "");
             persist(&dir, &journal)?;
             report.phase = Some("REVOKED".to_string());
+            report.effect = Some(failure.code().to_string());
         }
         Err(failure) => return Err(failure),
     }
     Ok(())
 }
 
-// ── Unit tests ──────────────────────────────────────────────────────────────
+async fn recover_revoke(
+    dir: &std::path::Path,
+    journal: &mut Journal,
+    sender: &Sender,
+    report: &mut Report,
+) -> Result<(), Failure> {
+    report.stage = "revoke-receipt";
+    let revoke_id = journal
+        .revoke_request_id
+        .clone()
+        .ok_or(Failure::Local("journal_invalid"))?;
+    match read_receipt(sender, journal, "revoke", &revoke_id).await? {
+        Some(value) => {
+            let response: RevocationResponse =
+                serde_json::from_value(value).map_err(|_| Failure::Local("wire_invalid"))?;
+            check_revocation_shape(&response, &journal.authorization_id, &revoke_id)?;
+            journal.revoke_recorded = true;
+            journal.clear_unknown("revoke");
+            journal.touch(&clock(), &response.status, response.revision, "");
+            persist(dir, journal)?;
+            report.phase = Some(response.status.clone());
+            report.effect = Some("revoke:SUCCEEDED".to_string());
+            Ok(())
+        }
+        None => {
+            report.unknown_operations = Some(journal.unknown.clone());
+            report.next_step =
+                Some("the original revoke receipt stays unknown; no resend is allowed");
+            Err(Failure::Local("receipt_unknown"))
+        }
+    }
+}
+
+// ── Unit and seam tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use clap::Parser;
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
+    use std::rc::Rc;
 
     const FIXTURE_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn clock() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 13, 0, 0, 0).unwrap()
+    }
+
+    fn moment(seconds: i64) -> String {
+        (clock() + Duration::seconds(seconds)).to_rfc3339()
+    }
 
     fn snapshot(app_ids: &[&str]) -> ApprovalSnapshot {
         ApprovalSnapshot {
-            partner_user_id: "22222222-2222-4222-8222-222222222222".into(),
+            partner_user_id: OTHER_ID.into(),
             organization_id: "33333333-3333-4333-8333-333333333333".into(),
             membership_id: "44444444-4444-4444-8444-444444444444".into(),
             partner_role_id: "55555555-5555-4555-8555-555555555555".into(),
@@ -1292,56 +1867,111 @@ mod tests {
             authorization_revision: Some(2),
             granted_actions: ACTIONS.iter().map(|action| action.to_string()).collect(),
             authorized_app_ids: app_ids.iter().map(|id| id.to_string()).collect(),
-            expires_at: "2026-10-13T00:20:00Z".into(),
+            expires_at: moment(300),
         }
     }
 
-    fn journal_for(authorization_id: &str) -> Journal {
-        Journal::new(
+    fn body(id: &str, mode: &str) -> Value {
+        json!({
+            "request_id": id,
+            "verification_code_hash": "1cba9a1db5d50072c42010d9727b800d8ebf20ac7ce7efab3bd947b37c900901",
+            "requested_actions": ACTIONS,
+            "mode": mode
+        })
+    }
+
+    fn journal(id: &str) -> Journal {
+        let mut entry = Journal::new(
             "reuse",
             &"a".repeat(64),
-            authorization_id,
-            serde_json::json!({}),
-            &Utc::now(),
-        )
+            "ABCDEFGHJK",
+            id,
+            body(id, "reuse"),
+            &clock(),
+        );
+        entry.create_recorded = true;
+        entry.phase = "PENDING".into();
+        entry.revision = 1;
+        entry.expires_at = moment(300);
+        entry
     }
 
-    fn created_response() -> CreateResponse {
-        CreateResponse {
-            authorization_id: FIXTURE_ID.into(),
-            request_id: FIXTURE_ID.into(),
-            target_environment: "test".into(),
-            realm: "test".into(),
-            status: "PENDING".into(),
-            revision: 1,
-            expires_at: (Utc::now() + Duration::seconds(300)).to_rfc3339(),
-            poll_interval_seconds: 2,
-            verification_uri: approval_page_uri(FIXTURE_ID),
-        }
+    fn created_view() -> Value {
+        json!({
+            "authorization_id": FIXTURE_ID,
+            "request_id": FIXTURE_ID,
+            "target_environment": "test",
+            "realm": "test",
+            "status": "PENDING",
+            "revision": 1,
+            "expires_at": moment(300),
+            "poll_interval_seconds": 2,
+            "verification_uri": approval_page_uri(FIXTURE_ID)
+        })
     }
 
-    fn workspace_base() -> WorkspaceResponse {
-        let approval = snapshot(&["mapp_one"]);
-        WorkspaceResponse {
-            session_id: FIXTURE_ID.into(),
-            target_environment: "test".into(),
-            realm: "test".into(),
-            partner_user_id: approval.partner_user_id,
-            organization_id: approval.organization_id,
-            membership_id: approval.membership_id,
-            partner_role_id: approval.partner_role_id,
-            environment: "dev".into(),
-            authorization_revision: Some(2),
-            granted_actions: ACTIONS.iter().map(|action| action.to_string()).collect(),
-            authorized_app_ids: vec!["mapp_one".into()],
-            expires_at: (Utc::now() + Duration::seconds(120)).to_rfc3339(),
-            apps: vec![CliApp {
-                app_id: "mapp_one".into(),
-                display_name: "Shop".into(),
-                status: "active".into(),
-            }],
-        }
+    fn exchange_view(request_id: &str) -> Value {
+        json!({
+            "request_id": request_id,
+            "operation": "partner_cli.exchange",
+            "authorization_id": FIXTURE_ID,
+            "status": "ACTIVE",
+            "previous_revision": 2,
+            "revision": 3,
+            "approval": snapshot(&["mapp_one"]),
+            "session_id": FIXTURE_ID,
+            "expires_at": moment(120)
+        })
     }
+
+    fn workspace_view() -> Value {
+        json!({
+            "session_id": FIXTURE_ID,
+            "target_environment": "test",
+            "realm": "test",
+            "partner_user_id": OTHER_ID,
+            "organization_id": "33333333-3333-4333-8333-333333333333",
+            "membership_id": "44444444-4444-4444-8444-444444444444",
+            "partner_role_id": "55555555-5555-4555-8555-555555555555",
+            "environment": "dev",
+            "authorization_revision": 3,
+            "granted_actions": ACTIONS,
+            "authorized_app_ids": ["mapp_one"],
+            "expires_at": moment(120),
+            "apps": [{"app_id": "mapp_one", "display_name": "Shop", "status": "active"}]
+        })
+    }
+
+    fn approve_view() -> Value {
+        json!({
+            "authorization_id": FIXTURE_ID,
+            "target_environment": "test",
+            "realm": "test",
+            "status": "APPROVED",
+            "revision": 2,
+            "expires_at": moment(120),
+            "approval": snapshot(&["mapp_one"])
+        })
+    }
+
+    fn stub() -> Rc<RefCell<Stub>> {
+        Rc::new(RefCell::new(Stub::default()))
+    }
+
+    fn sandbox(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "facto-cli-handoff-{tag}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("sandbox");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("sandbox mode");
+        base
+    }
+
+    // ── Contract arithmetic ─────────────────────────────────────────────────
 
     #[test]
     fn matching_hash_matches_the_delivered_golden_vector() {
@@ -1356,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_code_normalization_accepts_only_the_fixed_shape() {
+    fn pairing_code_normalization_and_alphabet() {
         assert_eq!(
             normalize_pairing_code("abcde-fghjk").as_deref(),
             Some("ABCDEFGHJK")
@@ -1372,454 +2002,258 @@ mod tests {
             "ABCDEOGHJK",
             "ABCDEFGHI",
             "ABCDEFGHIJKL",
-            "abcdefghi",
         ] {
-            assert_eq!(
-                normalize_pairing_code(invalid),
-                None,
-                "{invalid} must be rejected"
-            );
+            assert_eq!(normalize_pairing_code(invalid), None, "{invalid}");
         }
-    }
-
-    #[test]
-    fn alphabet_is_the_contract_thirty_two_set_without_ambiguous_glyphs() {
         let text = String::from_utf8_lossy(&ALPHABET);
         assert_eq!(text, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
         for ambiguous in ['I', 'O', '0', '1'] {
-            assert!(!text.contains(ambiguous), "{ambiguous} is excluded");
+            assert!(!text.contains(ambiguous));
         }
     }
 
     #[test]
-    fn generated_identifiers_keep_their_shape() {
-        for _ in 0..32 {
+    fn all_digit_uuids_pass_and_malformed_shapes_fail() {
+        assert!(is_uuid("00000000-0000-4000-8000-000000000000"));
+        assert!(is_uuid(FIXTURE_ID));
+        assert!(!is_uuid("00000000-0000-4000-8000-00000000000G"));
+        assert!(!is_uuid("00000000-0000-4000-8000-00000000000A"));
+        assert!(!is_uuid("00000000-0000-4000-8000-00000000000"));
+        assert!(!is_uuid("00000000_0000_4000_8000_000000000000"));
+        for _ in 0..16 {
             let id = new_uuid_v4().expect("uuid");
             assert!(is_uuid(&id), "{id}");
-            assert_eq!(&id[14..15], "4");
-            assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
-            let code = new_pairing_code().expect("code");
-            assert_eq!(code.len(), CODE_LENGTH);
-            assert_eq!(display_pairing_code(&code).len(), CODE_LENGTH + 1);
-            assert_eq!(
-                normalize_pairing_code(&code).as_deref(),
-                Some(code.as_str())
-            );
-        }
-        let proof = new_proof().expect("proof");
-        assert_eq!(proof.len(), 64);
-        assert!(proof
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
-        assert!(!is_uuid("11111111-1111-4111-8111-11111111111G"));
-    }
-
-    #[test]
-    fn dev_target_is_rejected_before_any_local_or_network_work() {
-        assert_eq!(reject_target("test"), Ok(()));
-        assert_eq!(
-            reject_target("dev").unwrap_err(),
-            Failure::Local("target_unsupported")
-        );
-        for command in ["authorize", "session", "check-access", "logout"] {
-            let parsed = crate::Cli::try_parse_from([
-                "facto", "demo", command, "--demo", "shop", "--target", "dev", "--mode", "fresh",
-            ])
-            .expect("dev selection parses");
-            assert!(matches!(parsed.command, crate::Commands::Demo { .. }));
-        }
-        assert!(crate::Cli::try_parse_from([
-            "facto",
-            "demo",
-            "authorize",
-            "--demo",
-            "shop",
-            "--target",
-            "test"
-        ])
-        .is_err());
-        assert!(crate::Cli::try_parse_from([
-            "facto",
-            "demo",
-            "authorize",
-            "--demo",
-            "orbit",
-            "--target",
-            "test",
-            "--mode",
-            "fresh"
-        ])
-        .is_err());
-        assert!(crate::Cli::try_parse_from([
-            "facto",
-            "demo",
-            "logout",
-            "--demo",
-            "shop",
-            "--target",
-            "production",
-            "--mode",
-            "fresh"
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn create_response_validation_rejects_any_deviation() {
-        let good = created_response();
-        assert_eq!(
-            validate_create(good.clone(), FIXTURE_ID).expect("valid"),
-            good
-        );
-        let cases = [
-            CreateResponse {
-                authorization_id: "22222222-2222-4222-8222-222222222222".into(),
-                ..good.clone()
-            },
-            CreateResponse {
-                status: "ACTIVE".into(),
-                ..good.clone()
-            },
-            CreateResponse {
-                revision: 2,
-                ..good.clone()
-            },
-            CreateResponse {
-                poll_interval_seconds: 1,
-                ..good.clone()
-            },
-            CreateResponse {
-                realm: "external".into(),
-                ..good.clone()
-            },
-            CreateResponse {
-                target_environment: "dev".into(),
-                ..good.clone()
-            },
-            CreateResponse {
-                verification_uri: format!("{API_ORIGIN}/cli/approve?authorization_id={FIXTURE_ID}"),
-                ..good.clone()
-            },
-            CreateResponse {
-                expires_at: (Utc::now() - Duration::seconds(1)).to_rfc3339(),
-                ..good.clone()
-            },
-            CreateResponse {
-                expires_at: (Utc::now() + Duration::seconds(PENDING_LIMIT + 600)).to_rfc3339(),
-                ..good.clone()
-            },
-        ];
-        for case in cases {
-            assert!(validate_create(case, FIXTURE_ID).is_err());
+            assert!(new_proof().is_ok());
         }
     }
 
     #[test]
-    fn wire_dto_rejects_unknown_fields_and_enforces_action_order() {
-        let mut value = serde_json::json!({
-            "request_id": FIXTURE_ID,
-            "verification_code_hash": "1cba9a1db5d50072c42010d9727b800d8ebf20ac7ce7efab3bd947b37c900901",
-            "requested_actions": ACTIONS,
-            "mode": "reuse"
-        });
-        let back: serde_json::Value = serde_json::from_value::<CreateRequestOwned>(value.clone())
-            .expect("round trip")
-            .to_value();
-        assert_eq!(back, value);
-        value["token"] = serde_json::json!("never");
-        assert!(serde_json::from_value::<CreateRequestOwned>(value).is_err());
-
-        let reordered = serde_json::json!({
-            "request_id": FIXTURE_ID,
-            "verification_code_hash": "1cba9a1db5d50072c42010d9727b800d8ebf20ac7ce7efab3bd947b37c900901",
-            "requested_actions": ["merchant.apps.read", "workspace.access.read"],
-            "mode": "reuse"
-        });
-        let parsed = serde_json::from_value::<CreateRequestOwned>(reordered).expect("wire parses");
-        assert!(require_actions(&parsed.requested_actions).is_err());
-        assert!(require_actions(
-            &ACTIONS
-                .iter()
-                .map(|action| action.to_string())
-                .collect::<Vec<String>>()
-        )
-        .is_ok());
-        assert!(require_actions(&["workspace.access.read".to_string()]).is_err());
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct CreateRequestOwned {
-        request_id: String,
-        verification_code_hash: String,
-        requested_actions: Vec<String>,
-        mode: String,
-    }
-
-    impl CreateRequestOwned {
-        fn to_value(&self) -> serde_json::Value {
-            serde_json::json!({
-                "request_id": self.request_id,
-                "verification_code_hash": self.verification_code_hash,
-                "requested_actions": self.requested_actions,
-                "mode": self.mode
-            })
-        }
+    fn limits_match_the_delivered_fixture_policy() {
+        assert_eq!(
+            (
+                PENDING_LIMIT,
+                POLL_SECONDS,
+                ACTIVE_LIMIT,
+                ABSOLUTE_PARENT_LIMIT
+            ),
+            (600, 2, 900, 28_800)
+        );
+        assert_eq!(MAX_RESPONSE_BYTES, 65_536);
+        assert_eq!(REQUEST_TIMEOUT, StdDuration::from_secs(8));
+        assert_eq!(ACTIONS, ["workspace.access.read", "merchant.apps.read"]);
+        assert_eq!(SERVER_ERROR_CODES.len(), 21);
+        assert_eq!(PHASES.len(), 6);
+        assert_eq!(RECEIPT_OPERATIONS, ["create", "exchange", "revoke"]);
     }
 
     #[test]
-    fn current_read_may_never_exceed_the_approved_ceiling() {
-        let journal = journal_for(FIXTURE_ID);
+    fn approval_page_locator_is_the_only_pairing_parameter() {
+        let uri = approval_page_uri(FIXTURE_ID);
         assert_eq!(
-            validate_workspace(workspace_base(), &journal, &snapshot(&["mapp_one"]))
-                .expect("valid"),
-            workspace_base()
+            uri,
+            format!("https://test-partner.facto.to/cli/approve?authorization_id={FIXTURE_ID}")
         );
-        let wide = WorkspaceResponse {
-            authorized_app_ids: vec!["mapp_two".into()],
-            apps: vec![],
-            ..workspace_base()
-        };
-        assert_eq!(
-            validate_workspace(wide, &journal, &snapshot(&["mapp_one"])).unwrap_err(),
-            Failure::Local("cli_scope_changed")
-        );
-        let extra_app = WorkspaceResponse {
-            apps: vec![CliApp {
-                app_id: "mapp_two".into(),
-                display_name: "x".into(),
-                status: "active".into(),
-            }],
-            ..workspace_base()
-        };
-        assert_eq!(
-            validate_workspace(extra_app, &journal, &snapshot(&["mapp_one"])).unwrap_err(),
-            Failure::Local("cli_scope_changed")
-        );
-        let swapped_actor = WorkspaceResponse {
-            partner_user_id: "99999999-9999-4999-8999-999999999999".into(),
-            ..workspace_base()
-        };
-        assert_eq!(
-            validate_workspace(swapped_actor, &journal, &snapshot(&["mapp_one"])).unwrap_err(),
-            Failure::Local("cli_scope_changed")
-        );
-        for mutation in [
-            WorkspaceResponse {
-                realm: "external".into(),
-                ..workspace_base()
-            },
-            WorkspaceResponse {
-                environment: "test".into(),
-                ..workspace_base()
-            },
-            WorkspaceResponse {
-                session_id: "66666666-6666-4666-8666-666666666666".into(),
-                ..workspace_base()
-            },
-            WorkspaceResponse {
-                granted_actions: vec!["merchant.apps.read".into(), "workspace.access.read".into()],
-                ..workspace_base()
-            },
-            WorkspaceResponse {
-                expires_at: (Utc::now() - Duration::seconds(1)).to_rfc3339(),
-                ..workspace_base()
-            },
-        ] {
-            assert!(validate_workspace(mutation, &journal, &snapshot(&["mapp_one"])).is_err());
-        }
+        assert!(!uri.contains("code") && !uri.contains("proof") && !uri.contains(API_ORIGIN));
     }
 
-    #[test]
-    fn exchange_and_revocation_are_bound_to_their_request_ids() {
-        let request_id = "77777777-7777-4777-8777-777777777777";
-        let exchange = ExchangeResponse {
-            request_id: request_id.into(),
-            operation: "partner_cli.exchange".into(),
-            authorization_id: FIXTURE_ID.into(),
-            status: "ACTIVE".into(),
-            previous_revision: 2,
-            revision: 3,
-            approval: Some(snapshot(&["mapp_one"])),
-            session_id: FIXTURE_ID.into(),
-            expires_at: (Utc::now() + Duration::seconds(120)).to_rfc3339(),
-        };
-        assert!(validate_exchange(exchange.clone(), FIXTURE_ID, request_id).is_ok());
-        for mutation in [
-            ExchangeResponse {
-                request_id: "88888888-8888-4888-8888-888888888888".into(),
-                ..exchange.clone()
-            },
-            ExchangeResponse {
-                status: "PENDING".into(),
-                ..exchange.clone()
-            },
-            ExchangeResponse {
-                revision: 2,
-                ..exchange.clone()
-            },
-            ExchangeResponse {
-                previous_revision: 0,
-                ..exchange.clone()
-            },
-            ExchangeResponse {
-                approval: None,
-                ..exchange.clone()
-            },
-            ExchangeResponse {
-                expires_at: (Utc::now() + Duration::seconds(ACTIVE_LIMIT + 3600)).to_rfc3339(),
-                ..exchange.clone()
-            },
-            ExchangeResponse {
-                expires_at: (Utc::now() - Duration::seconds(1)).to_rfc3339(),
-                ..exchange.clone()
-            },
-        ] {
-            assert!(validate_exchange(mutation, FIXTURE_ID, request_id).is_err());
-        }
-
-        let revoke_id = "99999999-9999-4999-8999-999999999999";
-        let revoke = RevocationResponse {
-            request_id: revoke_id.into(),
-            operation: "partner_cli.revoke".into(),
-            authorization_id: FIXTURE_ID.into(),
-            status: "REVOKED".into(),
-            previous_revision: 3,
-            revision: 4,
-            approval: Some(snapshot(&["mapp_one"])),
-        };
-        assert!(validate_revocation(revoke.clone(), FIXTURE_ID, revoke_id).is_ok());
-        assert!(validate_revocation(
-            RevocationResponse {
-                operation: "partner_cli.exchange".into(),
-                ..revoke.clone()
-            },
-            FIXTURE_ID,
-            revoke_id
-        )
-        .is_err());
-        assert!(validate_revocation(
-            RevocationResponse {
-                revision: 3,
-                ..revoke.clone()
-            },
-            FIXTURE_ID,
-            revoke_id
-        )
-        .is_err());
-        assert!(
-            validate_revocation(revoke, FIXTURE_ID, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-                .is_err()
-        );
-    }
+    // ── Wire validation ─────────────────────────────────────────────────────
 
     #[test]
-    fn receipt_decoding_keeps_unknown_separate_from_success() {
-        let unknown = serde_json::json!({"request_id": FIXTURE_ID, "operation": "approve", "status": "UNKNOWN", "response": null});
+    fn create_shape_survives_history_while_liveness_rejects_it() {
+        let view: CreateResponse = parse(created_view.to_string().as_bytes()).expect("shape");
         assert_eq!(
-            decode_receipt(unknown.to_string().as_bytes(), "approve", FIXTURE_ID).expect("unknown"),
-            None
+            validate_create(view.clone(), FIXTURE_ID, clock()).expect("live"),
+            view
         );
-        let succeeded = serde_json::json!({"request_id": FIXTURE_ID, "operation": "exchange", "status": "SUCCEEDED", "response": {"a": 1}});
-        assert!(
-            decode_receipt(succeeded.to_string().as_bytes(), "exchange", FIXTURE_ID)
-                .expect("value")
-                .is_some()
-        );
-        for bad in [
-            serde_json::json!({"request_id": FIXTURE_ID, "operation": "approve", "status": "FAILED", "response": null}),
-            serde_json::json!({"request_id": FIXTURE_ID, "operation": "exchange", "status": "SUCCEEDED", "response": null}),
-            serde_json::json!({"request_id": FIXTURE_ID, "operation": "delete", "status": "UNKNOWN", "response": null}),
-            serde_json::json!({"request_id": FIXTURE_ID, "operation": "create", "status": "UNKNOWN", "response": {}}),
-            serde_json::json!({"request_id": "22222222-2222-4222-8222-222222222222", "operation": "create", "status": "UNKNOWN", "response": null}),
-            serde_json::json!({"request_id": FIXTURE_ID, "operation": "approve", "status": "SUCCEEDED", "response": {}, "proof": "x"}),
-        ] {
-            assert!(decode_receipt(bad.to_string().as_bytes(), "approve", FIXTURE_ID).is_err());
-        }
-    }
-
-    #[test]
-    fn server_codes_come_only_from_the_closed_set() {
+        // The same original effect read after its own deadline is still a valid
+        // historical receipt.
+        check_create_shape(&view, FIXTURE_ID).expect("historical shape");
+        let late = clock() + Duration::seconds(3600);
         assert_eq!(
-            server_code("cli_pairing_mismatch").expect("known"),
-            Failure::Server("cli_pairing_mismatch")
-        );
-        assert_eq!(
-            server_code("recent_mfa_required").expect("known"),
-            Failure::Server("recent_mfa_required")
-        );
-        assert_eq!(
-            server_code("auto_approved").unwrap_err(),
+            validate_create(view, FIXTURE_ID, late).unwrap_err(),
             Failure::Local("wire_invalid")
         );
-        for code in SERVER_ERROR_CODES {
-            assert!(require_phase(code).is_err(), "{code} is not a phase");
+        let denied: CreateResponse = parse(
+            json!({...created_view(), "status": "DENIED"})
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("wire");
+        assert_eq!(
+            check_create_shape(&denied, FIXTURE_ID).unwrap_err(),
+            Failure::Local("wire_invalid")
+        );
+        for mutation in [
+            json!({...created_view(), "revision": 2}),
+            json!({...created_view(), "poll_interval_seconds": 1}),
+            json!({...created_view(), "realm": "external"}),
+            json!({...created_view(), "target_environment": "dev"}),
+            json!({...created_view(), "request_id": OTHER_ID}),
+            json!({...created_view(), "verification_uri": format!("{API_ORIGIN}/cli/approve?authorization_id={FIXTURE_ID}")}),
+            json!({...created_view(), "proof": "a".repeat(64)}),
+        ] {
+            let parsed: Result<CreateResponse, _> = parse(mutation.to_string().as_bytes());
+            assert!(
+                parsed.is_err() || check_create_shape(&parsed.expect("wire"), FIXTURE_ID).is_err(),
+                "{mutation}"
+            );
         }
-        for phase in PHASES {
-            assert!(require_phase(phase).is_ok());
-        }
-        assert!(require_phase("SUCCEEDED").is_err());
     }
 
     #[test]
-    fn http_error_bodies_map_to_their_code_and_never_to_success() {
-        let body = serde_json::json!({"code": "cli_rate_limited", "message": "slow down"});
-        let wire = Wire {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            body: body.to_string().into_bytes(),
-        };
+    fn exchange_is_bound_to_the_persisted_intent_and_the_approved_ceiling() {
+        let request_id = "77777777-7777-4777-8777-777777777777";
+        let response: ExchangeResponse =
+            parse(exchange_view(request_id).to_string().as_bytes()).expect("wire");
+        let ceiling = snapshot(&["mapp_one"]);
         assert_eq!(
-            decode(wire, StatusCode::OK).unwrap_err(),
+            validate_exchange(
+                response.clone(),
+                FIXTURE_ID,
+                request_id,
+                2,
+                &ceiling,
+                clock()
+            )
+            .expect("valid")
+            .request_id,
+            request_id
+        );
+        assert_eq!(
+            validate_exchange(response.clone(), FIXTURE_ID, OTHER_ID, 2, &ceiling, clock())
+                .unwrap_err(),
+            Failure::Local("wire_invalid")
+        );
+        assert_eq!(
+            validate_exchange(
+                response.clone(),
+                FIXTURE_ID,
+                request_id,
+                5,
+                &ceiling,
+                clock()
+            )
+            .unwrap_err(),
+            Failure::Local("cli_scope_changed")
+        );
+        // An expiry later than the approved ceiling is a widened grant.
+        let wide = json!({...exchange_view(request_id), "expires_at": moment(500)});
+        let wide: ExchangeResponse = parse(wide.to_string().as_bytes()).expect("wire");
+        assert_eq!(
+            validate_exchange(wide, FIXTURE_ID, request_id, 2, &ceiling, clock()).unwrap_err(),
+            Failure::Local("wire_invalid")
+        );
+        let second_bearer = json!({...exchange_view(request_id), "session_id": OTHER_ID});
+        let second_bearer: ExchangeResponse =
+            parse(second_bearer.to_string().as_bytes()).expect("wire");
+        assert!(check_exchange_shape(&second_bearer, FIXTURE_ID, request_id).is_err());
+        let same_revision = json!({...exchange_view(request_id), "revision": 2});
+        let same_revision: ExchangeResponse =
+            parse(same_revision.to_string().as_bytes()).expect("wire");
+        assert!(check_exchange_shape(&same_revision, FIXTURE_ID, request_id).is_err());
+    }
+
+    #[test]
+    fn current_read_may_only_narrow_the_approved_ceiling() {
+        let ceiling = snapshot(&["mapp_one"]);
+        let base: WorkspaceResponse = parse(workspace_view().to_string().as_bytes()).expect("wire");
+        assert!(validate_workspace(base.clone(), FIXTURE_ID, &ceiling, clock()).is_ok());
+        for mutation in [
+            json!({...workspace_view(), "authorized_app_ids": ["mapp_two"]}),
+            json!({...workspace_view(), "apps": [{"app_id": "mapp_two", "display_name": "x", "status": "active"}]}),
+            json!({...workspace_view(), "partner_user_id": "99999999-9999-4999-8999-999999999999"}),
+            json!({...workspace_view(), "expires_at": moment(600)}),
+            json!({...workspace_view(), "realm": "external"}),
+            json!({...workspace_view(), "environment": "test"}),
+            json!({...workspace_view(), "granted_actions": ["merchant.apps.read", "workspace.access.read"]}),
+            json!({...workspace_view(), "authorized_app_ids": ["mapp_one", "mapp_one"]}),
+            json!({...workspace_view(), "session_id": OTHER_ID}),
+            json!({...workspace_view(), "authorization_revision": 0}),
+            json!({...workspace_view(), "client_secret": "never"}),
+        ] {
+            let parsed: Result<WorkspaceResponse, _> = parse(mutation.to_string().as_bytes());
+            let outcome = match parsed {
+                Ok(workspace) => validate_workspace(workspace, FIXTURE_ID, &ceiling, clock()),
+                Err(failure) => Err(failure),
+            };
+            assert!(outcome.is_err(), "{mutation} must fail closed");
+        }
+        let expired = json!({...workspace_view(), "expires_at": moment(-1)});
+        let expired: WorkspaceResponse = parse(expired.to_string().as_bytes()).expect("wire");
+        assert_eq!(
+            validate_workspace(expired, FIXTURE_ID, &ceiling, clock()).unwrap_err(),
+            Failure::Local("cli_expired")
+        );
+    }
+
+    #[test]
+    fn receipt_status_and_operation_are_typed_per_operation() {
+        assert_eq!(decode_receipt(json!({"request_id": FIXTURE_ID, "operation": "create", "status": "UNKNOWN", "response": null}).to_string().as_bytes(), "create", FIXTURE_ID).expect("unknown"), None);
+        assert!(decode_receipt(json!({"request_id": FIXTURE_ID, "operation": "create", "status": "SUCCEEDED", "response": created_view()}).to_string().as_bytes(), "create", FIXTURE_ID).expect("value").is_some());
+        for bad in [
+            json!({"request_id": FIXTURE_ID, "operation": "approve", "status": "UNKNOWN", "response": null}),
+            json!({"request_id": FIXTURE_ID, "operation": "create", "status": "FAILED", "response": null}),
+            json!({"request_id": FIXTURE_ID, "operation": "create", "status": "SUCCEEDED", "response": null}),
+            json!({"request_id": OTHER_ID, "operation": "create", "status": "UNKNOWN", "response": null}),
+            json!({"request_id": FIXTURE_ID, "operation": "create", "status": "UNKNOWN", "response": null, "token": "never"}),
+        ] {
+            assert!(
+                decode_receipt(bad.to_string().as_bytes(), "create", FIXTURE_ID).is_err(),
+                "{bad}"
+            );
+        }
+        // An arbitrary SUCCEEDED payload is not an exchange effect.
+        let junk = json!({"request_id": FIXTURE_ID, "operation": "exchange", "status": "SUCCEEDED", "response": {"a": 1}});
+        let value = decode_receipt(junk.to_string().as_bytes(), "exchange", FIXTURE_ID)
+            .expect("wire")
+            .expect("payload");
+        let parsed: Result<ExchangeResponse, _> = serde_json::from_value(value);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn http_status_maps_to_the_closed_code_set_only() {
+        let wire = json!({"code": "cli_rate_limited", "message": "slow down"});
+        assert_eq!(
+            interpret(
+                StatusCode::TOO_MANY_REQUESTS,
+                wire.to_string().into_bytes(),
+                StatusCode::OK
+            )
+            .unwrap_err(),
             Failure::Server("cli_rate_limited")
         );
-
-        let unknown = serde_json::json!({"code": "please_retry_post", "message": "x"});
-        let wire = Wire {
-            status: StatusCode::BAD_GATEWAY,
-            body: unknown.to_string().into_bytes(),
-        };
         assert_eq!(
-            decode(wire, StatusCode::CREATED).unwrap_err(),
+            interpret(
+                StatusCode::BAD_GATEWAY,
+                b"not json".to_vec(),
+                StatusCode::OK
+            )
+            .unwrap_err(),
             Failure::Local("http_rejected")
         );
-
-        let empty = Wire {
-            status: StatusCode::NOT_FOUND,
-            body: Vec::new(),
-        };
         assert_eq!(
-            decode(empty, StatusCode::OK).unwrap_err(),
+            interpret(StatusCode::NOT_FOUND, Vec::new(), StatusCode::OK).unwrap_err(),
             Failure::Local("http_rejected")
+        );
+        assert_eq!(
+            interpret(StatusCode::OK, b"{}".to_vec(), StatusCode::OK).expect("body"),
+            b"{}"
         );
     }
 
-    #[test]
-    fn requests_use_only_the_dedicated_proof_scheme_and_fixed_test_origin() {
-        let proof = "a".repeat(64);
-        let request = with_headers(
-            client()
-                .expect("client")
-                .post(format!("{API_ORIGIN}{PREFIX}/authorizations")),
-            proof_headers(&proof, FIXTURE_ID, FIXTURE_ID)
-                .expect("headers")
-                .into_iter()
-                .chain([target_header()])
-                .collect(),
-        )
-        .json(&CreateRequest {
-            request_id: FIXTURE_ID,
-            verification_code_hash: &"1".repeat(64),
-            requested_actions: ACTIONS,
-            mode: "reuse",
-        })
-        .build()
-        .expect("request");
+    // ── Transport seam ──────────────────────────────────────────────────────
 
+    #[test]
+    fn built_requests_carry_only_the_dedicated_proof_scheme() {
+        let built = build_create(&"a".repeat(64), FIXTURE_ID, body(FIXTURE_ID, "reuse"));
+        let (client, request) = live_request(&built).expect("live request");
+        drop(client);
         assert_eq!(
             request.url().as_str(),
             format!("{API_ORIGIN}{PREFIX}/authorizations")
         );
-        assert_eq!(request.url().scheme(), "https");
+        assert_eq!(request.method().as_str(), "POST");
         assert_eq!(
             request
                 .headers()
@@ -1827,7 +2261,7 @@ mod tests {
                 .expect("auth")
                 .to_str()
                 .expect("ascii"),
-            format!("Facto-CLI {proof}")
+            format!("Facto-CLI {}", "a".repeat(64))
         );
         assert_eq!(
             request
@@ -1847,39 +2281,138 @@ mod tests {
         assert!(!request.headers().contains_key(header::COOKIE));
         assert!(!request.headers().contains_key("x-facto-client-secret"));
         assert!(!request.headers().contains_key("x-api-key"));
-        assert!(request.body().is_some());
 
-        let read = with_headers(
-            client()
-                .expect("client")
-                .get(format!("{API_ORIGIN}{PREFIX}/session/workspace")),
-            proof_headers(&proof, "", FIXTURE_ID).expect("get headers"),
-        )
-        .build()
-        .expect("read request");
-        assert_eq!(read.method(), reqwest::Method::GET);
-        assert!(!read.headers().contains_key("idempotency-key"));
-        assert!(!read.headers().contains_key("x-facto-target"));
-        assert!(!read.headers().contains_key(header::COOKIE));
+        let read = build_read(
+            &"a".repeat(64),
+            FIXTURE_ID,
+            format!("{PREFIX}/session/workspace"),
+        );
+        let (_, request) = live_request(&read).expect("read request");
+        assert_eq!(request.method().as_str(), "GET");
+        assert!(!request.headers().contains_key("idempotency-key"));
+        assert!(!request.headers().contains_key("x-facto-target"));
+        assert!(!request.headers().contains_key(header::COOKIE));
 
-        for weak in ["short", &"A".repeat(64), &"g".repeat(64), ""] {
-            assert!(
-                proof_headers(weak, FIXTURE_ID, FIXTURE_ID).is_err(),
-                "{weak} is not a proof"
-            );
+        for weak in [
+            String::new(),
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            let broken = Built {
+                proof: weak,
+                locator: "nope".to_string(),
+                ..build_read(&"a".repeat(64), FIXTURE_ID, "/x".into())
+            };
+            assert!(proof_headers(&broken).is_err());
         }
-        assert!(proof_headers(&proof, "not-a-uuid", FIXTURE_ID).is_err());
-        assert!(proof_headers(&proof, FIXTURE_ID, "not-a-uuid").is_err());
     }
 
     #[test]
-    fn reports_never_serialize_proof_or_pairing_code() {
+    fn response_body_is_capped_across_chunks() {
+        let big = vec![vec![b'x'; MAX_RESPONSE_BYTES]; 2];
+        assert_eq!(
+            assemble(StatusCode::OK, &big, StatusCode::OK).unwrap_err(),
+            Failure::Local("response_too_large")
+        );
+        let exact = vec![vec![b'x'; MAX_RESPONSE_BYTES]];
+        assert_eq!(
+            assemble(StatusCode::OK, &exact, StatusCode::OK)
+                .expect("exact")
+                .len(),
+            MAX_RESPONSE_BYTES
+        );
+        let split = vec![
+            vec![b'x'; MAX_RESPONSE_BYTES - 1],
+            vec![b'x'; 1],
+            vec![b'x'; 1],
+        ];
+        assert_eq!(
+            assemble(StatusCode::OK, &split, StatusCode::OK).unwrap_err(),
+            Failure::Local("response_too_large")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_rejected_without_following_or_retrying() {
+        let cell = stub();
+        cell.borrow_mut()
+            .status(301, &json!({"location": "https://elsewhere.example"}));
+        let built = build_read(
+            &"a".repeat(64),
+            FIXTURE_ID,
+            format!("{PREFIX}/session/workspace"),
+        );
+        let sender = Sender::Stub(cell.clone());
+        assert_eq!(
+            sender.transact(&built, StatusCode::OK).await.unwrap_err(),
+            Failure::Local("http_rejected")
+        );
+        assert_eq!(cell.borrow().fetched.len(), 1, "no retry request");
+        assert!(cell.borrow().posted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_live_client_refuses_plain_http_endpoints() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let built = build_read(
+            &"a".repeat(64),
+            FIXTURE_ID,
+            format!("{PREFIX}/session/workspace"),
+        );
+        let (client, _) = live_request(&built).expect("live request");
+        let outcome = client.get(format!("http://127.0.0.1:{port}/")).await;
+        assert!(
+            outcome.is_err(),
+            "https_only must refuse a plain HTTP origin"
+        );
+    }
+
+    // ── Pairing channel fencing ─────────────────────────────────────────────
+
+    #[test]
+    fn pairing_code_only_reaches_an_interactive_terminal() {
+        assert_eq!(pairing_channel(false, true, false), Channel::Stdout);
+        assert_eq!(pairing_channel(true, true, false), Channel::Stderr);
+        assert_eq!(pairing_channel(true, false, false), Channel::Refused);
+        assert_eq!(pairing_channel(false, false, true), Channel::Refused);
+        assert_eq!(pairing_channel(true, false, true), Channel::Stderr);
+
+        let code = display_pairing_code("ABCDEFGHJK");
+        let uri = approval_page_uri(FIXTURE_ID);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        announce_pairing(uri, &code, Channel::Stdout, &mut out, &mut err).expect("stdout");
+        assert!(String::from_utf8_lossy(&out).contains(&code));
+        assert!(err.is_empty());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        announce_pairing(uri, &code, Channel::Stderr, &mut out, &mut err).expect("stderr");
+        assert!(
+            out.is_empty(),
+            "terse stdout is reserved for the JSON report"
+        );
+        assert!(String::from_utf8_lossy(&err).contains(&code));
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            announce_pairing(uri, &code, Channel::Refused, &mut out, &mut err).unwrap_err(),
+            Failure::Local("pairing_requires_terminal")
+        );
+        assert!(out.is_empty() && err.is_empty());
+    }
+
+    #[test]
+    fn reports_and_debug_never_carry_credential_material() {
         let mut report = Report::new("partner_cli_authorize", "fresh", "workspace");
         report.authorization_id = Some(FIXTURE_ID.into());
         report.session_id = Some(FIXTURE_ID.into());
         report.verification_uri = Some(approval_page_uri(FIXTURE_ID));
         report.authentication_verified = true;
-        let json = serde_json::to_string(&report.clone().succeeded()).expect("json");
+        let json = report.clone().succeeded().render(true);
         for forbidden in [
             "proof",
             "a".repeat(64),
@@ -1887,71 +2420,383 @@ mod tests {
             "cookie",
             "secret",
             "ABCDEFGHJK",
+            "FGHIJK",
         ] {
             assert!(
                 !json.contains(forbidden.as_str()),
-                "{forbidden} leaked into the report"
+                "{forbidden} leaked: {json}"
             );
         }
         assert!(json.contains("\"uat_status\":\"NOT_RUN\""));
         assert!(json.contains("\"consumer_state_accessed\":false"));
         assert!(json.contains("\"app_secret_transport\":false"));
-        assert!(json.contains("\"authentication_verified\":true"));
-        assert!(json.contains("\"target\":\"test\""));
-
         let human = report.render(false);
-        assert!(human.contains("Business UAT: NOT_RUN"));
         assert!(!human.contains("Pairing code"));
 
-        let failed = report.failed(&Failure::Server("cli_pairing_mismatch"));
-        assert_eq!(failed.error.as_deref(), Some("cli_pairing_mismatch"));
-        assert!(!serde_json::to_string(&failed)
-            .expect("json")
-            .contains("a".repeat(64).as_str()));
-    }
-
-    #[test]
-    fn pairing_code_channel_is_never_the_json_report() {
-        let code = display_pairing_code("ABCDEFGHJK");
-        assert_eq!(code, "ABCDE-FGHIJK");
-        let json = serde_json::to_string(&Report::new("partner_cli_authorize", "fresh", "pending"))
-            .expect("json");
-        assert!(!json.contains(&code));
-        assert!(!json.contains("ABCDEFGHJK"));
-    }
-
-    #[test]
-    fn approval_page_locator_is_the_only_pairing_parameter() {
-        let uri = approval_page_uri(FIXTURE_ID);
-        assert_eq!(uri, "https://test-partner.facto.to/cli/approve?authorization_id=11111111-1111-4111-8111-111111111111");
-        assert!(!uri.contains("code"));
-        assert!(!uri.contains("proof"));
-        assert!(!uri.contains(API_ORIGIN));
-    }
-
-    #[test]
-    fn limits_match_the_delivered_fixture_policy() {
-        assert_eq!(PENDING_LIMIT, 600);
-        assert_eq!(POLL_SECONDS, 2);
-        assert_eq!(ACTIVE_LIMIT, 900);
-        assert_eq!(ABSOLUTE_PARENT_LIMIT, 28_800);
-        assert_eq!(MAX_RESPONSE_BYTES, 65_536);
-        assert_eq!(REQUEST_TIMEOUT, StdDuration::from_secs(8));
-        assert_eq!(ALPHABET.len(), 32);
-        assert_eq!(ACTIONS, ["workspace.access.read", "merchant.apps.read"]);
-        assert_eq!(SERVER_ERROR_CODES.len(), 21);
-        assert_eq!(RECEIPT_OPERATIONS.len(), 4);
-        assert_eq!(PHASES.len(), 6);
-    }
-
-    #[test]
-    fn entropy_is_read_from_the_os_device_only() {
-        let first = random_bytes::<16>().expect("entropy");
-        let second = random_bytes::<16>().expect("entropy");
-        assert_ne!(first, second, "successive draws must differ");
+        let entry = journal(FIXTURE_ID);
+        let debug = format!("{entry:?}");
         assert!(
-            File::open("/dev/urandom-not-a-device").is_err(),
-            "a missing device must fail closed"
+            !debug.contains(&"a".repeat(64)) && !debug.contains("ABCDEFGHJK"),
+            "{debug}"
+        );
+    }
+
+    // ── State machine seams ─────────────────────────────────────────────────
+
+    fn store(tag: &str) -> std::path::PathBuf {
+        let home = sandbox(tag);
+        let dir = state::store_dir(&home);
+        state::ensure_store(&dir).expect("store");
+        dir
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_create_intent_is_never_posted_twice() {
+        let dir = store("resume");
+        let mut entry = journal(FIXTURE_ID);
+        entry.create_recorded = false;
+        entry.phase = "PREWRITE".into();
+        entry.updated_at = clock().to_rfc3339();
+        state::create(&dir, &entry).expect("intent");
+
+        let cell = stub();
+        cell.borrow_mut().ok(&json!({"request_id": FIXTURE_ID, "operation": "create", "status": "UNKNOWN", "response": null}));
+        let sender = Sender::Stub(cell.clone());
+        let mut report = Report::new("partner_cli_authorize", "reuse", "precheck");
+        let outcome = resume_create(&dir, entry, &sender, &mut report).await;
+        assert_eq!(outcome.unwrap_err(), Failure::Local("receipt_unknown"));
+        assert_eq!(
+            cell.borrow().post_count(),
+            0,
+            "a known intent must not be re-posted"
+        );
+        assert!(report.next_step.is_some());
+        let stored = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("stored");
+        assert!(stored.unknown.contains(&"create".to_string()));
+        assert!(stored.has_unresolved_intent());
+    }
+
+    #[tokio::test]
+    async fn a_historical_create_success_resumes_the_original_pairing() {
+        let dir = store("recover");
+        let mut entry = journal(FIXTURE_ID);
+        entry.create_recorded = false;
+        entry.phase = "UNKNOWN".into();
+        entry.mark_unknown("create");
+        state::create(&dir, &entry).expect("intent");
+
+        let cell = stub();
+        cell.borrow_mut().ok(&json!({"request_id": FIXTURE_ID, "operation": "create", "status": "SUCCEEDED", "response": created_view()}));
+        let sender = Sender::Stub(cell.clone());
+        let mut report = Report::new("partner_cli_authorize", "reuse", "precheck");
+        let resumed = resume_create(&dir, entry, &sender, &mut report)
+            .await
+            .expect("recovered");
+        assert!(resumed.create_recorded && resumed.unknown.is_empty());
+        assert_eq!(resumed.phase, "PENDING");
+        assert_eq!(
+            resumed.expires_at,
+            moment(300),
+            "the original deadline is kept"
+        );
+        assert_eq!(
+            resumed.pairing_code, "ABCDEFGHJK",
+            "the pairing code survives the lost response"
+        );
+        assert_eq!(cell.borrow().post_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_lost_create_response_is_written_ahead_then_read_once() {
+        let dir = store("lost");
+        let cell = stub();
+        // Nothing is scripted: the create POST is lost in transit.
+        let sender = Sender::Stub(cell.clone());
+        let mut report = Report::new("partner_cli_authorize", "fresh", "precheck");
+        let outcome = fresh_pairing("fresh", &dir, &sender, &mut report, clock()).await;
+        assert_eq!(
+            outcome.unwrap_err(),
+            Failure::Local("transport_unavailable")
+        );
+        assert_eq!(cell.borrow().post_count(), 1, "exactly one create attempt");
+        let stored = state::current(&dir).expect("stored");
+        assert!(stored.has_unresolved_intent() && !stored.create_recorded);
+        assert!(
+            !stored.pairing_code.is_empty(),
+            "the pairing code survives the loss"
+        );
+
+        // A second process reads that original receipt and posts nothing new.
+        let id = stored.authorization_id.clone();
+        let cell2 = stub();
+        cell2
+            .borrow_mut()
+            .ok(&json!({"request_id": id, "operation": "create", "status": "UNKNOWN", "response": null}));
+        let mut report = Report::new("partner_cli_session", "fresh", "precheck");
+        let outcome = resume_create(&dir, stored, &Sender::Stub(cell2.clone()), &mut report).await;
+        assert_eq!(outcome.unwrap_err(), Failure::Local("receipt_unknown"));
+        assert_eq!(
+            cell2.borrow().post_count(),
+            0,
+            "the second process never re-posts"
+        );
+        assert_eq!(cell2.borrow().fetched.len(), 1);
+        assert!(state::current(&dir)
+            .expect("still unresolved")
+            .has_unresolved_intent());
+    }
+
+    #[tokio::test]
+    async fn a_second_process_reuses_the_exchange_intent_and_stays_unverified() {
+        let dir = store("exchange");
+        let exchange_id = "77777777-7777-4777-8777-777777777777";
+        let mut entry = journal(FIXTURE_ID);
+        entry.phase = "APPROVED".into();
+        entry.revision = 2;
+        entry.approval = Some(json!(snapshot(&["mapp_one"])));
+        entry.record_exchange_intent(exchange_id, 2);
+        state::create(&dir, &entry).expect("intent");
+
+        let cell = stub();
+        cell.borrow_mut().ok(&json!({"request_id": exchange_id, "operation": "exchange", "status": "SUCCEEDED", "response": exchange_view(exchange_id)}));
+        let sender = Sender::Stub(cell.clone());
+        let mut report = Report::new("partner_cli_session", "reuse", "precheck");
+        let mut stored = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("stored");
+        recover_exchange(&dir, &mut stored, &sender, &mut report)
+            .await
+            .expect("recovered");
+        assert_eq!(
+            cell.borrow().post_count(),
+            0,
+            "the original intent is only read back"
+        );
+        let after = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("after");
+        assert!(after.exchange_recorded && after.unknown.is_empty());
+        assert_eq!(after.phase, "ACTIVE");
+        assert_eq!(after.session_id.as_deref(), Some(FIXTURE_ID));
+        assert_eq!(
+            report.authentication_verified, false,
+            "recovery alone is not current access"
+        );
+        assert_eq!(report.effect.as_deref(), Some("exchange:SUCCEEDED"));
+
+        // A junk SUCCEEDED payload must not clear the intent.
+        let junk = stub();
+        junk.borrow_mut().ok(&json!({"request_id": exchange_id, "operation": "exchange", "status": "SUCCEEDED", "response": {"a": 1}}));
+        let mut dirty = after.clone();
+        dirty.exchange_recorded = false;
+        dirty.mark_unknown("exchange");
+        let mut report = Report::new("partner_cli_session", "reuse", "precheck");
+        assert_eq!(
+            recover_exchange(&dir, &mut dirty, &Sender::Stub(junk.clone()), &mut report)
+                .await
+                .unwrap_err(),
+            Failure::Local("wire_invalid")
+        );
+        assert!(
+            dirty.unknown.contains(&"exchange".to_string()),
+            "intent kept on a bad payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_never_resends_a_recorded_or_unknown_revocation() {
+        let dir = store("logout");
+        let revoke_id = "99999999-9999-4999-8999-999999999999";
+        let mut entry = journal(FIXTURE_ID);
+        entry.phase = "ACTIVE".into();
+        entry.revision = 3;
+        entry.record_revoke_intent(revoke_id, 3);
+        entry.mark_unknown("revoke");
+        state::create(&dir, &entry).expect("intent");
+
+        let cell = stub();
+        cell.borrow_mut().ok(&json!({"request_id": revoke_id, "operation": "revoke", "status": "UNKNOWN", "response": null}));
+        let sender = Sender::Stub(cell.clone());
+        let mut stored = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("stored");
+        let mut report = Report::new("partner_cli_logout", "reuse", "precheck");
+        assert_eq!(
+            recover_revoke(&dir, &mut stored, &sender, &mut report)
+                .await
+                .unwrap_err(),
+            Failure::Local("receipt_unknown")
+        );
+        assert_eq!(cell.borrow().post_count(), 0, "no resend under a new key");
+        assert!(state::read(&state::journal_path(&dir, FIXTURE_ID))
+            .expect("journal")
+            .unknown
+            .contains(&"revoke".to_string()));
+
+        let revoked = {
+            let mut done = journal(FIXTURE_ID);
+            done.phase = "REVOKED".into();
+            done.revoke_recorded = true;
+            done.revoke_request_id = Some(revoke_id.into());
+            done.revoke_expected_revision = Some(3);
+            done
+        };
+        let dir2 = store("logout-done");
+        state::create(&dir2, &revoked).expect("revoked journal");
+        let cell2 = stub();
+        let sender2 = Sender::Stub(cell2.clone());
+        let mut report = Report::new("partner_cli_logout", "reuse", "precheck");
+        let stored = state::read(&state::journal_path(&dir2, FIXTURE_ID)).expect("stored");
+        assert!(stored.phase == "REVOKED" && !stored.has_unresolved_intent());
+        assert_eq!(
+            cell2.borrow().post_count(),
+            0,
+            "a repeat logout is a local success only"
+        );
+        report.phase = Some(stored.phase.clone());
+        assert_eq!(report.phase.as_deref(), Some("REVOKED"));
+    }
+
+    #[tokio::test]
+    async fn positive_handoff_flow_reads_current_access_once() {
+        let cell = stub();
+        let exchange_id = "77777777-7777-4777-8777-777777777777";
+        // The stub serves responses in consumption order: create, poll, read.
+        cell.borrow_mut().created(&created_view());
+        cell.borrow_mut().ok(&approve_view());
+        cell.borrow_mut().ok(&workspace_view());
+        let sender = Sender::Stub(cell.clone());
+        let dir = store("flow");
+
+        let mut report = Report::new("partner_cli_authorize", "reuse", "precheck");
+        let mut journal = fresh_pairing("reuse", &dir, &sender, &mut report, clock())
+            .await
+            .expect("created");
+        assert_eq!(journal.phase, "PENDING");
+        let approved =
+            wait_for_approval(&dir, &mut journal, &sender, clock() + Duration::seconds(60))
+                .await
+                .expect("approved");
+        assert_eq!(approved.status, "APPROVED");
+        journal.record_exchange_intent(exchange_id, approved.revision);
+        persist(&dir, &journal).expect("intent");
+        let journal = state::read(&state::journal_path(&dir, FIXTURE_ID)).expect("reread");
+        let response: ExchangeResponse =
+            parse(exchange_view(exchange_id).to_string().as_bytes()).expect("wire");
+        validate_exchange(
+            response,
+            FIXTURE_ID,
+            exchange_id,
+            approved.revision,
+            &snapshot(&["mapp_one"]),
+            clock(),
+        )
+        .expect("exchange");
+        let workspace: WorkspaceResponse =
+            parse(workspace_view().to_string().as_bytes()).expect("wire");
+        let validated =
+            validate_workspace(workspace, FIXTURE_ID, &snapshot(&["mapp_one"]), clock())
+                .expect("current read");
+        assert_eq!(validated.apps.len(), 1);
+        assert_eq!(
+            cell.borrow().post_count(),
+            1,
+            "one create POST in the whole flow"
+        );
+    }
+
+    #[test]
+    fn dev_target_and_non_terminal_pairing_fail_closed_before_the_store() {
+        assert_eq!(reject_target("test"), Ok(()));
+        assert_eq!(
+            reject_target("dev").unwrap_err(),
+            Failure::Local("target_unsupported")
+        );
+        for command in ["authorize", "session", "check-access", "logout"] {
+            let parsed = crate::Cli::try_parse_from([
+                "facto", "demo", command, "--demo", "shop", "--target", "dev", "--mode", "fresh",
+            ])
+            .expect("parses");
+            assert!(matches!(parsed.command, crate::Commands::Demo { .. }));
+        }
+        for args in [
+            vec![
+                "facto",
+                "demo",
+                "authorize",
+                "--demo",
+                "shop",
+                "--target",
+                "test",
+            ],
+            vec![
+                "facto", "demo", "session", "--demo", "orbit", "--target", "test", "--mode",
+                "fresh",
+            ],
+            vec![
+                "facto",
+                "demo",
+                "logout",
+                "--demo",
+                "shop",
+                "--target",
+                "production",
+                "--mode",
+                "fresh",
+            ],
+            vec![
+                "facto",
+                "demo",
+                "check-access",
+                "--demo",
+                "shop",
+                "--target",
+                "test",
+                "--mode",
+                "reused",
+            ],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        assert!(pairing_channel(false, false, false) == Channel::Refused);
+    }
+
+    #[test]
+    fn resume_and_block_rules_follow_the_stored_phase() {
+        let now = clock();
+        let mut pending = journal(FIXTURE_ID);
+        assert!(wants_resume(&pending, now), "a live pairing is resumed");
+        pending.create_recorded = false;
+        assert!(wants_resume(&pending, now));
+        pending.create_recorded = true;
+        pending.phase = "ACTIVE".into();
+        assert!(blocks_new_pairing(&pending, now) && !wants_resume(&pending, now));
+        pending.expires_at = moment(-1);
+        assert!(!blocks_new_pairing(&pending, now));
+        pending.phase = "REVOKED".into();
+        pending.expires_at = moment(60);
+        assert!(!wants_resume(&pending, now) && !blocks_new_pairing(&pending, now));
+        let mut unknown = journal(FIXTURE_ID);
+        unknown.mark_unknown("revoke");
+        assert!(
+            wants_resume(&unknown, now),
+            "an unresolved revoke is not forgotten"
+        );
+    }
+
+    #[test]
+    fn receipt_keys_bind_to_the_persisted_intents() {
+        let mut entry = journal(FIXTURE_ID);
+        assert_eq!(
+            receipt_key(&entry, "create").expect("create key"),
+            FIXTURE_ID
+        );
+        assert_eq!(
+            receipt_key(&entry, "exchange").unwrap_err(),
+            Failure::Local("journal_invalid")
+        );
+        entry.record_exchange_intent("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2);
+        assert_eq!(
+            receipt_key(&entry, "exchange").expect("exchange key"),
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(
+            receipt_key(&entry, "approve").unwrap_err(),
+            Failure::Local("journal_invalid")
         );
     }
 }

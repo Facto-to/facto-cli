@@ -137,6 +137,9 @@ facto demo check-access --demo shop --target test --mode reuse
 facto demo logout       --demo shop --target test --mode reuse
 ```
 
+- `authorize` requires an interactive terminal (stdout, or stderr with -t). With
+  no terminal it refuses with `pairing_requires_terminal` before touching the
+  private store or the network, and it never opens a browser.
 - `authorize` draws one possession proof and one pairing code from the OS random
   device, persists the pairing before the single create request, then opens
   `https://test-partner.facto.to/cli/approve?authorization_id=<UUID>` and polls.
@@ -144,8 +147,10 @@ facto demo logout       --demo shop --target test --mode reuse
   recent MFA. Pending pairing lasts at most 10 minutes; the exchanged read ends
   at the earliest of parent session, selected context and 15 minutes. Nothing
   renews automatically.
-- The pairing code appears on the terminal only. Never put it in a URL, JSON
-  report, receipt or log. The proof never leaves the private store.
+- The pairing code appears on an interactive terminal only, never on a piped
+  stream, in the JSON report, a URL, a receipt or a log. It is kept in the
+  private journal so an interrupted pairing can show it again. The proof never
+  leaves the private store.
 - `session` reads the stored pairing plus original operation receipts; no
   create/exchange/refresh. `check-access` performs exactly one current read and
   returns public App metadata within the approved ceiling. `logout` revokes this

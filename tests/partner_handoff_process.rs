@@ -64,15 +64,24 @@ fn assert_never_reaches_network_or_state(output: &Output) {
         "an endpoint was echoed: {text}"
     );
     // 64 hex characters would mean a proof or hash crossed a public channel.
+    let flat = text.to_string();
     assert!(
-        !text
-            .chars()
-            .collect::<String>()
+        !flat
             .as_bytes()
             .windows(64)
             .any(|window| window.iter().all(|byte| byte.is_ascii_hexdigit())),
         "credential-shaped material leaked into the output"
     );
+    assert!(!flat.contains("Facto-CLI"), "the proof scheme leaked");
+    let characters: Vec<char> = flat.chars().collect();
+    for window in characters.windows(11) {
+        let shape = window[5] == '-'
+            && window
+                .iter()
+                .enumerate()
+                .all(|(offset, c)| offset == 5 || (c.is_ascii_uppercase() && !"IO01".contains(*c)));
+        assert!(!shape, "a pairing code shape leaked");
+    }
 }
 
 #[test]
@@ -171,6 +180,75 @@ fn symlinked_store_is_refused() {
     }
 }
 
+#[test]
+fn a_non_terminal_authorize_refuses_before_any_post_or_journal() {
+    // These tests run with piped stdio, so neither stream is a terminal. The
+    // pairing therefore has to refuse before touching the store or the wire.
+    let home = sandbox("no tty");
+    for mode in ["fresh", "reuse"] {
+        let output = run(
+            &home,
+            &[
+                "-t",
+                "demo",
+                "authorize",
+                "--demo",
+                "shop",
+                "--target",
+                "test",
+                "--mode",
+                mode,
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "authorize must refuse a non-terminal"
+        );
+        let value = parsed(&output);
+        assert_eq!(value["error"], "pairing_requires_terminal");
+        assert_eq!(value["authentication_verified"], false);
+        assert_eq!(value["stage"], "precheck", "no stage was reached");
+        assert!(
+            !store_dir(&home).exists(),
+            "a refused pairing creates no private store"
+        );
+        assert_never_reaches_network_or_state(&output);
+        let both = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!both.contains("Pairing code"), "{both}");
+    }
+}
+
+#[test]
+fn pairing_hints_are_absent_from_every_non_terminal_channel() {
+    let home = sandbox("hint fence");
+    for command in ["session", "check-access", "logout"] {
+        let output = run(
+            &home,
+            &[
+                "-t", "demo", command, "--demo", "shop", "--target", "test", "--mode", "reuse",
+            ],
+        );
+        assert!(!output.status.success(), "{command} refuses an empty store");
+        let both = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !both.contains("Pairing code"),
+            "{command} leaked a pairing prompt"
+        );
+        assert!(
+            !both.contains("Facto-CLI"),
+            "{command} leaked the proof scheme"
+        );
+        assert_never_reaches_network_or_state(&output);
+    }
+}
 #[test]
 fn argument_surface_is_closed_and_explicit() {
     let home = sandbox("args");
