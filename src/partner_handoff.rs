@@ -12,7 +12,6 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::header::{self, HeaderName, HeaderValue};
 use reqwest::{redirect, Client, Request, StatusCode};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -1435,10 +1434,9 @@ async fn wait_for_approval(
                 transport_failures = 0;
                 journal.touch(&clock(), &view.status, view.revision, &view.expires_at);
                 if let Some(snapshot) = &view.approval {
-                    journal.approval = Some(
-                        serde_json::to_value(snapshot)
-                            .map_err(|_| Failure::Local("wire_invalid"))?,
-                    );
+                    // A polled view may agree with or narrow the ceiling, never
+                    // widen what was approved.
+                    record_approval(journal, snapshot)?;
                 }
                 persist(dir, journal)?;
                 match view.status.as_str() {
@@ -2154,7 +2152,6 @@ mod tests {
     // `Sender::Live` with the pinned origin; only these tests inject a loopback
     // origin, and nothing here reads an environment value or relaxes TLS.
 
-    use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2313,7 +2310,7 @@ mod tests {
                 "request_id": request_id,
                 "operation": receipt_operation(path),
                 "status": "SUCCEEDED",
-                "response": respond_to(receipt_operation(path), path, body, false)
+                "response": respond_to(&receipt_operation(path), path, body, false)
             }),
             _ => json!({
                 "session_id": auth,
@@ -2567,7 +2564,7 @@ mod tests {
 
     #[test]
     fn create_shape_survives_history_while_liveness_rejects_it() {
-        let view: CreateResponse = parse(created_view.to_string().as_bytes()).expect("shape");
+        let view: CreateResponse = parse(created_view().to_string().as_bytes()).expect("shape");
         assert_eq!(
             validate_create(view.clone(), FIXTURE_ID, clock()).expect("live"),
             view
@@ -2822,19 +2819,30 @@ mod tests {
         assert!(!request.headers().contains_key("x-facto-target"));
         assert!(!request.headers().contains_key(header::COOKIE));
 
-        for weak in [
+        let weak_proofs: [String; 4] = [
             String::new(),
             "a".repeat(63),
             "A".repeat(64),
             "g".repeat(64),
-        ] {
+        ];
+        for weak in weak_proofs {
             let broken = Built {
                 proof: weak,
-                locator: "nope".to_string(),
                 ..build_read(&"a".repeat(64), FIXTURE_ID, "/x".into())
             };
-            assert!(proof_headers(&broken).is_err());
+            assert!(
+                proof_headers(&broken).is_err(),
+                "proof shape must be rejected"
+            );
         }
+        let bad_locator = Built {
+            locator: "nope".to_string(),
+            ..build_read(&"a".repeat(64), FIXTURE_ID, "/x".into())
+        };
+        assert!(
+            proof_headers(&bad_locator).is_err(),
+            "locator must be a UUID"
+        );
     }
 
     #[test]
@@ -2891,7 +2899,14 @@ mod tests {
             format!("{PREFIX}/session/workspace"),
         );
         let (client, _) = live_request(&built).expect("live request");
-        let outcome = client.get(format!("http://127.0.0.1:{port}/")).await;
+        // The listener is released first, so the refusal is immediate instead
+        // of waiting on the request timeout.
+        drop(listener);
+        let outcome = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .map(|response| response.status());
         assert!(
             outcome.is_err(),
             "https_only must refuse a plain HTTP origin"
@@ -2912,13 +2927,13 @@ mod tests {
         let uri = approval_page_uri(FIXTURE_ID);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        announce_pairing(uri, &code, Channel::Stdout, &mut out, &mut err).expect("stdout");
+        announce_pairing(&uri, &code, Channel::Stdout, &mut out, &mut err).expect("stdout");
         assert!(String::from_utf8_lossy(&out).contains(&code));
         assert!(err.is_empty());
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        announce_pairing(uri, &code, Channel::Stderr, &mut out, &mut err).expect("stderr");
+        announce_pairing(&uri, &code, Channel::Stderr, &mut out, &mut err).expect("stderr");
         assert!(
             out.is_empty(),
             "terse stdout is reserved for the JSON report"
@@ -2928,7 +2943,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         assert_eq!(
-            announce_pairing(uri, &code, Channel::Refused, &mut out, &mut err).unwrap_err(),
+            announce_pairing(&uri, &code, Channel::Refused, &mut out, &mut err).unwrap_err(),
             Failure::Local("pairing_requires_terminal")
         );
         assert!(out.is_empty() && err.is_empty());
@@ -3163,10 +3178,18 @@ mod tests {
         let dir2 = store("logout-done");
         state::create(&dir2, &revoked).expect("revoked journal");
         let cell2 = stub();
-        let sender2 = Sender::Stub(cell2.clone());
         let mut report = Report::new("partner_cli_logout", "reuse", "precheck");
         let stored = state::read(&state::journal_path(&dir2, FIXTURE_ID)).expect("stored");
-        assert!(stored.phase == "REVOKED" && !stored.has_unresolved_intent());
+        // The kernel's own gate: a recorded revocation with no pending intent is
+        // a definite local success and never reaches a POST.
+        assert_eq!(
+            (
+                stored.phase.as_str(),
+                stored.revoke_recorded,
+                stored.pending_intents().is_empty()
+            ),
+            ("REVOKED", true, true)
+        );
         assert_eq!(
             cell2.borrow().post_count(),
             0,
@@ -3275,7 +3298,7 @@ mod tests {
                 "reused",
             ],
         ] {
-            assert!(crate::Cli::try_parse_from(args).is_err(), "{args:?}");
+            assert!(crate::Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
         assert!(pairing_channel(false, false, false) == Channel::Refused);
     }

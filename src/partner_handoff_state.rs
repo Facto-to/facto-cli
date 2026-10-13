@@ -244,7 +244,7 @@ impl Journal {
     /// True when an original intent is still owed a receipt read. A lost create
     /// response must not be forgotten by starting a new pairing.
     pub(crate) fn has_unresolved_intent(&self) -> bool {
-        !self.create_recorded || !self.unknown.is_empty() || self.pending_intents().count() > 0
+        !self.create_recorded || !self.unknown.is_empty() || !self.pending_intents().is_empty()
     }
 
     /// Every original intent that was claimed but never proven recorded. These
