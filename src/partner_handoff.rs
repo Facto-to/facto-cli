@@ -3287,8 +3287,8 @@ mod tests {
         assert!(after.exchange_recorded && after.unknown.is_empty());
         assert_eq!(after.phase, "ACTIVE");
         assert_eq!(after.session_id.as_deref(), Some(FIXTURE_ID));
-        assert_eq!(
-            report.authentication_verified, false,
+        assert!(
+            !report.authentication_verified,
             "recovery alone is not current access"
         );
         assert_eq!(report.effect.as_deref(), Some("exchange:SUCCEEDED"));
@@ -3690,8 +3690,8 @@ mod tests {
             validate_workspace(workspace, &journal.authorization_id, &ceiling, now()).unwrap_err(),
             Failure::Local("cli_scope_changed")
         );
-        assert_eq!(
-            report.authentication_verified, false,
+        assert!(
+            !report.authentication_verified,
             "a refused read is never verified"
         );
     }
@@ -3788,7 +3788,7 @@ mod tests {
                 .await
                 .and_then(|(_, failures)| match failures.first() {
                     None => Ok(()),
-                    Some(code) => Err(server_or_local(code.split(':').last().unwrap_or(""))),
+                    Some(code) => Err(server_or_local(code.split(':').next_back().unwrap_or(""))),
                 }),
             other => panic!("unknown child stage {other}"),
         };
