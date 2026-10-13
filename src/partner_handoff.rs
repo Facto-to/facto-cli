@@ -2193,6 +2193,7 @@ mod tests {
     // `Sender::Live` with the pinned origin; only these tests inject a loopback
     // origin, and nothing here reads an environment value or relaxes TLS.
 
+    use std::collections::HashMap;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2214,6 +2215,9 @@ mod tests {
         /// Receipt reads answered as UNKNOWN, to reproduce an effect that stays
         /// unknown until a later process reads it again.
         unknown_receipt: Arc<AtomicUsize>,
+        /// Effects the server actually processed, keyed by operation and
+        /// original request id. A receipt read may only replay one of these.
+        effects: Arc<Mutex<HashMap<String, String>>>,
     }
 
     fn loopback() -> (String, Fixture) {
@@ -2231,6 +2235,7 @@ mod tests {
             chunked: Arc::new(AtomicUsize::new(0)),
             widen: Arc::new(AtomicUsize::new(0)),
             unknown_receipt: Arc::new(AtomicUsize::new(0)),
+            effects: Arc::new(Mutex::new(HashMap::new())),
         };
         let server = fixture.clone();
         std::thread::spawn(move || {
@@ -2268,6 +2273,19 @@ mod tests {
         }
     }
 
+    fn request_key(body: &str, path: &str) -> String {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("request_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| locator(path))
+    }
+
     fn receipt_operation(path: &str) -> String {
         path.split("/requests/")
             .nth(1)
@@ -2291,7 +2309,7 @@ mod tests {
         })
     }
 
-    fn respond_to(kind: &str, path: &str, body: &str, widen: bool, unknown: bool) -> Value {
+    fn respond_to(kind: &str, path: &str, body: &str, widen: bool) -> Value {
         let now = Utc::now();
         let auth = locator(path);
         let request_id = serde_json::from_str::<Value>(body)
@@ -2351,18 +2369,7 @@ mod tests {
                 "revision": 4,
                 "approval": snapshot_json(&["mapp_one"])
             }),
-            "receipt" if unknown => json!({
-                "request_id": request_id,
-                "operation": receipt_operation(path),
-                "status": "UNKNOWN",
-                "response": null
-            }),
-            "receipt" => json!({
-                "request_id": request_id,
-                "operation": receipt_operation(path),
-                "status": "SUCCEEDED",
-                "response": respond_to(&receipt_operation(path), path, body, false, false)
-            }),
+            "receipt" => Value::Null,
             _ => json!({
                 "session_id": auth,
                 "target_environment": "test",
@@ -2486,13 +2493,51 @@ mod tests {
             return;
         }
         let widen = fixture.widen.load(Ordering::SeqCst) > 0;
-        let unknown = if kind == "receipt" {
-            fixture.unknown_receipt.swap(0, Ordering::SeqCst) > 0
-        } else {
-            false
-        };
-        let payload =
-            serde_json::to_vec(&respond_to(kind, &path, &body, widen, unknown)).expect("payload");
+        if kind == "receipt" {
+            // Only an effect this server actually processed may be reported,
+            // and always with the payload and deadline it produced at the time.
+            let operation = receipt_operation(&path);
+            let key = path.rsplit('/').next().unwrap_or("").to_string();
+            let recorded = fixture
+                .effects
+                .lock()
+                .expect("effect lock")
+                .get(&format!("{operation}:{key}"))
+                .cloned();
+            let not_yet_visible = fixture.unknown_receipt.swap(0, Ordering::SeqCst) > 0;
+            let answer = match recorded.filter(|_| !not_yet_visible) {
+                Some(effect) => json!({
+                    "request_id": key,
+                    "operation": operation,
+                    "status": "SUCCEEDED",
+                    "response": serde_json::from_str::<Value>(&effect).expect("recorded effect")
+                }),
+                None => json!({
+                    "request_id": key,
+                    "operation": operation,
+                    "status": "UNKNOWN",
+                    "response": null
+                }),
+            };
+            let receipt_body = serde_json::to_vec(&answer).expect("receipt payload");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                receipt_body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&receipt_body);
+            let _ = stream.flush();
+            return;
+        }
+        let payload = serde_json::to_vec(&respond_to(kind, &path, &body, widen)).expect("payload");
+        if method == "POST" && matches!(kind, "create" | "exchange" | "revoke") {
+            // The effect exists server-side even when the reply is lost below.
+            let key = request_key(&body, &path);
+            fixture.effects.lock().expect("effect lock").insert(
+                format!("{kind}:{key}"),
+                String::from_utf8_lossy(&payload).to_string(),
+            );
+        }
         if fixture.chunked.load(Ordering::SeqCst) > 0 {
             fixture.chunked.fetch_sub(1, Ordering::SeqCst);
             let _ = stream.write_all(
@@ -3779,6 +3824,34 @@ mod tests {
         line.trim_start_matches(&marker).to_string()
     }
 
+    /// The deadline the fixture recorded for the operation this scenario lost.
+    fn recorded_expiry(server: &Fixture, dir: &std::path::Path, label: &str) -> String {
+        let journal = journal_of(dir);
+        let operation = match label {
+            "lost-exchange" => "exchange",
+            "lost-revoke" => "revoke",
+            _ => "create",
+        };
+        let key = match operation {
+            "exchange" => journal.exchange_request_id.clone().unwrap_or_default(),
+            "revoke" => journal.revoke_request_id.clone().unwrap_or_default(),
+            _ => journal.create_request_id.clone(),
+        };
+        let effect = server
+            .effects
+            .lock()
+            .expect("effect lock")
+            .get(&format!("{operation}:{key}"))
+            .cloned()
+            .expect("recorded effect");
+        serde_json::from_str::<Value>(&effect)
+            .expect("recorded json")
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
     fn journal_of(dir: &std::path::Path) -> Journal {
         state::current(dir).expect("journal")
     }
@@ -3802,6 +3875,7 @@ mod tests {
             ),
         ];
         for (label, stages, expected_first) in cases {
+            let prewrite = label == "prewrite";
             let (origin, server) = loopback();
             let dir = store(&format!("children-{label}"));
             for stage in stages.iter().take(stages.len() - 1) {
@@ -3843,11 +3917,16 @@ mod tests {
                 "{label} keeps the original intent"
             );
 
-            // The second, separate process: the reply is now reachable, and it
-            // may only read the same request ids.
+            // The second, separate process may only read the same request ids.
+            // Nothing was ever sent for a pre-write intent, so the server still
+            // has no effect to report and the child has to fail closed.
             server.unknown_receipt.store(0, Ordering::SeqCst);
             let second = spawn_child(&origin, dir.as_path(), "recover");
-            assert_eq!(second, "ok", "{label} second child recovered");
+            if prewrite {
+                assert_eq!(second, "receipt_unknown", "{label} has no effect to replay");
+            } else {
+                assert_eq!(second, "ok", "{label} second child recovered");
+            }
 
             let after = journal_of(&dir);
             let keys_after = (
@@ -3865,15 +3944,35 @@ mod tests {
                 server.gets.load(Ordering::SeqCst) > gets_after_first,
                 "{label} the second child read the original receipt"
             );
-            assert!(
-                after.pending_intents().is_empty(),
-                "{label} intent resolved"
-            );
-            assert!(after.create_recorded, "{label} create proven");
+            if prewrite {
+                assert!(!after.create_recorded, "{label} stays unresolved");
+                assert!(
+                    after.pending_intents().contains(&"create"),
+                    "{label} keeps the original intent"
+                );
+                assert_eq!(
+                    server.posts.load(Ordering::SeqCst),
+                    0,
+                    "{label} never posted"
+                );
+            } else {
+                assert!(
+                    after.pending_intents().is_empty(),
+                    "{label} intent resolved"
+                );
+                assert!(after.create_recorded, "{label} create proven");
+                let recorded = recorded_expiry(&server, &dir, label);
+                // The recovered deadline is exactly what the fixture recorded
+                // when the reply was lost: recovery may not renew or widen.
+                assert_eq!(
+                    after.expires_at, recorded,
+                    "{label} recovery must not renew the approval"
+                );
+            }
             assert!(
                 !keys_before.1.as_deref().unwrap_or("").is_empty()
                     || label == "lost-create"
-                    || label == "prewrite",
+                    || prewrite,
                 "{label} an exchange key is never invented later"
             );
             let seen = server.seen.lock().expect("seen");
